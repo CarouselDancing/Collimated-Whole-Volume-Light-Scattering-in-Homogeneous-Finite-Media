@@ -1,6 +1,6 @@
 # Collimated-Whole-Volume-Light-Scattering-in-Homogeneous-Finite-Media
 
-Demo code provided as an .html file<br><br>
+Demo code in this repository (Supplemental shader.htm)<br><br>
 Links:
 * [Project page](http://3dgraphics.guru/publication/box-medium/)<br>
 * [Paper](http://3dgraphics.guru/pdf/VM22_TVCG.pdf)<br>
