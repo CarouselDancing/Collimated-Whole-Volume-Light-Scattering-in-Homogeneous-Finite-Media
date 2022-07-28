@@ -1,0 +1,2825 @@
+<!DOCTYPE html>
+<!-- The <script> part is where the shader is implemented! !-->
+<html lang="en"><!-- HTML boilerplate and UI !--><head>
+<meta http-equiv="content-type" content="text/html; charset=UTF-8">
+        <title>Supplemental shader</title>
+        <meta charset="UTF-8">
+        <style>
+            #parameters_box
+            {
+                float: left;
+                width: 20%;
+                overflow: hidden;
+            }
+
+            #inner_box
+            {
+                padding: 10px 10px 10px 10px;
+            }
+
+            #draw_surface_box
+            {
+                width: 80%;
+                height: 100%;
+                overflow: hidden;
+            }
+
+            #ui_elements_surface
+            {
+                position: absolute;
+                left: 20%;
+                top: 0px;
+                z-index: 10;
+            }
+
+            #draw_surface
+            {
+                z-index: 11;
+            }
+        </style>
+    <script type="text/x-mathjax-config">MathJax.Hub.Register.StartupHook("NativeMML Jax Ready", function () {MathJax.OutputJax.NativeMML.Augment({preTranslate: function (state) {
+  var scripts = state.jax[this.id];
+  for (var i = 0; i < scripts.length; i++) {
+    var script = scripts[i]; if (!script.parentNode) continue;
+    // Remove any existing output
+    var prev = script.previousSibling;
+    if (prev && prev.className === "MathJax_MathML")
+      prev.parentNode.removeChild(prev);
+    // Add the MathJax span
+    var jax = script.MathJax.elementJax; if (!jax) continue;
+    var math = jax.root; jax.NativeMML = {};
+    var type = (math.Get("display") === "block" ? "div" : "span");
+    var span = MathJax.HTML.Element(type,{
+      className: "MathJax_MathML", id:jax.inputID+"-Frame"
+    },[["span",{
+      className:"MathJax_MathContainer", isMathJax: true, jaxID:this.id,
+    },[["span",{isMathJax:true}]]
+    ]]);
+    script.parentNode.insertBefore(span,script);
+  }
+}});MathJax.OutputJax.NativeMML.ffTableWidthBug = false;MathJax.OutputJax.NativeMML.forceReflow = false;MathJax.OutputJax.NativeMML.widthBug = false;MathJax.OutputJax.NativeMML.spaceWidthBug = false;MathJax.OutputJax.NativeMML.mtdWidthBug = false;});MathJax.Hub.Register.StartupHook("End Extensions", function () {if (MathJax.Extension.mml2jax) {  for (var i=0,m=MathJax.Hub.preProcessors.hooks.length; i < m; i++) {    if (MathJax.Hub.preProcessors.hooks[i].hook ===        MathJax.Extension.mml2jax.PreProcess)      { MathJax.Hub.preProcessors.hooks.splice(i,1); i--; m--; }  }}});</script></head> 
+    <body style="margin: 0; overflow: hidden;">
+        <div id="canvas_group">
+            <div id="parameters_box">
+                <div id="inner_box">
+                <form>
+                    <input type="hidden" id="rendering" name="rendering" value="false">
+                    <p>Scene:</p>
+                    <input type="radio" name="scene" value="box_scene" checked="checked">Box
+                    <input type="radio" name="scene" value="gobo_scene">Gobo<br>
+                    <hr>
+                    <p>Integrators:</p>
+                    <hr>
+                    <input type="radio" name="integrator" value="box_importance" checked="checked">Whole Volume Distance Sampling<br>
+                    <input type="radio" name="integrator" value="ray_marching">Ray Marching<br>
+                    <input type="radio" name="integrator" value="ratio_estimator">Ratio Estimator with Ray Marching<br>
+                    <input type="radio" name="integrator" value="distance_sampling">Distance Sampling<br>
+                    <input type="radio" name="integrator" value="ratio_estimator_distance_sampling">Ratio Estimator with Distance Sampling<br>
+                    <hr><hr><p>Parameters:</p>
+                    <hr>
+                    <label for="sample_count">Sample count:</label>
+                    <input type="number" id="sample_count" name="sample_count" min="1" max="1024" value="4"><br>
+                    <label for="ray_depth">Ray depth:</label>
+                    <input type="number" id="ray_depth" name="ray_depth" min="1" max="1024" value="1"><br>
+                    <label for="extinction">Extinction:</label>
+                    <input type="number" id="extinction" step="0.01" value="1.0"><br>
+                    <label for="hg_g">Henyey-Greenstein G:</label>
+                    <input type="number" id="hg_g" step="0.01" value="0.0" min="0.0" max="1.0"><br>
+                    <label for="albedo">Albedo:</label>
+                    <input type="color" id="albedo" name="albedo" value="#ffffff"><br>
+                    <label for="sky_color">Sky color:</label>
+                    <input type="color" id="sky_color" name="sky_color" value="#000000"><br>
+                    <hr>
+                    <p>Scroll to move forwards and backwards!</p>
+                </form>
+                </div>
+            </div>
+            <div id="draw_surface_box">
+                <canvas id="draw_surface" width="1536" height="955"></canvas>
+                <canvas id="ui_elements_surface" width="1536" height="955"></canvas>
+            </div>
+        </div>
+        <!-- The main code explaining how the techniques described in
+             'Box Medium: Whole Volume Collimated Light Single-ScatteringIntegration and Sampling'
+             are implemented.
+         !-->
+        <script>
+            const sphere_position = [ 0.4, 1, -6, 0.5 ];
+            const sphere_radius = 0.5;
+            const light_dir_box_scene = [ 0.2, 0.5, -1 ];
+            //const light_dir_box_scene = [0, 1.0, 0];
+
+            const shader_toy = `
+                // Math pi constant
+                const float pi = 3.14159265359;
+
+            #if ACCUMULATE_MODE == 2
+                layout(location=1) out vec4 AdditionalSurface;
+                layout(location=2) out vec4 AdditionalSurface2;
+            #endif
+
+            #if USE_GOBO
+                #define MULTIPLE_LIGHTS 1
+            #else
+                #define MULTIPLE_LIGHTS 0
+            #endif
+
+                ////////////////
+                // PARAMETERS //
+                ////////////////
+
+                // Vertical field-of-view
+                const float FOV_Y = 40.0;
+
+                // Distance to near plane
+                const float NearPlane = 0.1;
+
+                // Vector of Gobo positions for the 
+                const vec4 GoboPositionRadius[3] = vec4[3](
+                    vec4(0.3, 1, -6, 0.8),
+                    vec4(-0.7, 1, -8, 0.55),
+                    vec4(0.1, 1.2, -7, 0.6));
+
+                // Light intensity in the gobo scene
+                const float GoboLightIntensity = 0.2 * 4.0 * pi;
+
+                // Light intensity in the box scene
+                const float LightIntensity = 1.0 * 4.0 * pi;
+
+                // Vector of all light intensities for all scenes
+                const vec3 LightColor[4] = vec3[4](
+                    vec3(1, 1, 0.5)*GoboLightIntensity,
+                    vec3(0.5, 0.5, 1)*GoboLightIntensity,
+                    vec3(0.5, 1, 0.5)*GoboLightIntensity,
+                    vec3(1, 1, 1)*LightIntensity
+                );
+                
+                // Direction of the collimated light for all scenes
+                const vec3 LightDir[4] = vec3[4](
+                    normalize(vec3(` + light_dir_box_scene[0] + `, ` + light_dir_box_scene[1] + `, ` + light_dir_box_scene[2] + `)),
+                    normalize(vec3(1, 1, -1)),
+                    normalize(vec3(-1, 3, -3)),
+                    normalize(vec3(` + light_dir_box_scene[0] + `, ` + light_dir_box_scene[1] + `, ` + light_dir_box_scene[2] + `)));
+                
+                // Start index in LightColor and LightDir for the gobo scene
+                #define GOBO_LIGHT_START_IDX 0u
+
+                // Count of elements in LightColor and LightDir for the gobo scene
+                #define GOBO_LIGHT_COUNT 3u
+
+                // Start index in LightColor and LightDir for the box scene
+                #define LIGHT_START_IDX 3u
+
+                // Count of elements in LightColor and LightDir for the box scene
+                #define LIGHT_COUNT 1u
+
+                // Rotation around the up axis in the gobo scene
+                const float GoboBoxRotUp = 45.0;
+
+                // Rotation around the up axis in the box scene
+                const float BoxRotUp = 30.0;
+
+                // Size of box in the gobo scene
+                const vec3 GoboBoxSize = vec3(3, 1.5, 3);
+
+                // Size of box in the box scene
+                const vec3 BoxSize = vec3(3, 1.0, 3);
+
+                // Box position in the gobo scene
+                const vec3 GoboBoxPosition = vec3(0, 0.5, -7);
+
+                // Box position in the box scene
+                const vec3 BoxPosition = vec3(0, 0, -7);
+
+                // Sphere position in the box scene
+                vec4 SpherePosition = vec4(` + sphere_position[0] + `, ` + sphere_position[1] + `, ` + sphere_position[2] + `, ` + sphere_radius + `);
+
+                //////////////////////////////////////////////
+                // Scene parameters
+                //////////////////////////////////////////////
+
+                #define SkyColor SkyColorParameter.xyz 
+
+                uniform vec4 SkyColorParameter;
+                //////////////////////////////////////////////
+
+                //////////////////////////////////////////////
+                // INTEGRATOR enum
+                // MCWVDS integrator from the main article
+                #define WHOLE_VOLUME_DISTANCE_SAMPLING             0u
+
+                // RM integrator from the main article
+                #define RAY_MARCHING                        1u
+
+                // REES integrator from the main article
+                #define RATIO_ESTIMATOR                     2u
+
+                // MCDS integrator from the main article
+                #define DISTANCE_SAMPLING                   3u
+
+                // REDS integrator from the main article
+                #define RATIO_ESTIMATOR_DISTANCE_SAMPLING   4u
+                //////////////////////////////////////////////
+
+                /////////////////////////////////////////////////
+                uniform uvec4 IntegratorParameters;
+
+                // Frame index for multi-frame accumulation purposes
+                #define FrameIndex IntegratorParameters.x
+
+                // Integrator single-scattering sample count
+                #define SampleCount IntegratorParameters.y
+
+                // Enable multiple scattering integrators by selecting ray depth greater than 1
+                #define RayDepth IntegratorParameters.w
+                /////////////////////////////////////////////////
+
+                ///////////////////////////////////////////
+                uniform vec4 CameraParameters;
+                // Camera position in world coordinates
+                #define CameraPosition CameraParameters.xyz
+
+                // Light intensity multiplier for debug purposes
+                #define LightIntensityMultiplier CameraParameters.w
+                ///////////////////////////////////////////
+
+                /////////////////////////////////////////////////////////////////
+                uniform vec4 VolumeParameters;
+                uniform vec4 VolumeParameters2;
+                // Volumetric extinction parameter
+                #define Extinction VolumeParameters.x
+
+                // Geometry parameter controlling forward and backward scattering
+                #define HenyeyGreensteinG VolumeParameters.y
+
+                // Volumetric albedo
+                #define Albedo VolumeParameters2.xyz
+                #define ScatteringCoef (Albedo * Extinction)
+                /////////////////////////////////////////////////////////////////
+
+                // Max distance that is well behaved compared to infinities
+                #define MAX_DISTANCE 1e32
+
+                ///////////////
+                // Functions //
+                ///////////////
+
+                #if ACCUMULATE_MODE == 0
+                #   define GENERATE_INIT_SEED(screen_coord, frame_idx) hash2d(uvec2(screen_coord))
+                #   define GENERATE_RANDOM_SAMPLE(seed) intel_rand(seed)
+                #   define SEED_TYPE uint
+                #else
+                #   define GENERATE_INIT_SEED(screen_coord, frame_idx) hash3d(uvec3(screen_coord, frame_idx))
+                #   define GENERATE_RANDOM_SAMPLE(seed) intel_rand(seed)
+                #   define SEED_TYPE uint
+
+                uniform sampler2D PrevFrame;
+                #if ACCUMULATE_MODE == 2
+                uniform sampler2D PrevFrame2;
+                uniform sampler2D PrevFrame3;
+                #endif
+
+                uniform vec4 MultiFrameMixFactor;
+                #endif
+
+                // Convert a single component from RGB to sRGB color space
+                float RGBToSRGBComponent(float val)
+                {
+                    if (val <= 0.0031308)
+                        return val * 12.92;
+                    else
+                        return 1.055 * pow(val, 1.0 / 2.4) - 0.055;
+                }
+
+                // Convert from RGB to sRGB color space
+                vec3 RGBToSRGB(vec3 color)
+                {
+                    return vec3(RGBToSRGBComponent(color.x), RGBToSRGBComponent(color.y), RGBToSRGBComponent(color.z));
+                }
+
+                // Minimum along all axes
+                float MinComponent(vec3 val)
+                {
+                    return min(min(val.x, val.y), val.z);
+                }
+
+                // Maximum along all axes
+                float MaxComponent(vec3 val)
+                {
+                    return max(max(val.x, val.y), val.z);
+                }
+
+                // AABB intersection test without clamping in box coordinates
+                // see appendix A in main text for more details
+                vec2 SlabTestUnbound(vec3 box_ray_origin, vec3 box_ray_dir)
+                {
+                    vec3 box_inv_ray_dir = 1.0 / box_ray_dir;
+
+                    vec3 box_t0 = (vec3(-1) - box_ray_origin) * box_inv_ray_dir;
+                    vec3 box_t1 = (vec3(1) - box_ray_origin) * box_inv_ray_dir;
+
+                    vec3 box_tmin3 = min(box_t0, box_t1);
+                    vec3 box_tmax3 = max(box_t0, box_t1);
+
+                    float box_tmin = MaxComponent(box_tmin3);
+                    float box_tmax = MinComponent(box_tmax3);
+                    return vec2(box_tmin, box_tmax);
+                }
+
+                // AABB intersection test without clamping with box coordinates transform
+                vec2 SlabTestUnbound(mat4x3 box_transform, vec3 org, vec3 dir)
+                {
+                    vec3 box_ray_origin = box_transform * vec4(org, 1);
+                    vec3 box_ray_dir = box_transform * vec4(dir, 0);
+                    return SlabTestUnbound(box_ray_origin, box_ray_dir);
+                }
+
+                // Building an Orthonormal Basis, Revisited
+                // Duff et al.
+                // http://jcgt.org/published/0006/01/01/
+                void BuildOrthoBasisDuff(vec3 normal, out vec3 tangent, out vec3 binormal)
+                {
+                    float sign_value = normal.z >= 0.0 ? 1.0 : -1.0;
+                    float a = -1.0/(sign_value + normal.z);
+                    float b = normal.x*normal.y*a;
+                    tangent = vec3(1.0 + sign_value*normal.x*normal.x*a, sign_value*b, -sign_value*normal.x);
+                    binormal = vec3(b, sign_value + normal.y*normal.y*a, -normal.y);
+                }
+
+                // Henyey-Greenstein phase function
+                float HenyeyGreensteinPhase(float g, float cos_theta)
+                {
+                    float g_sq = g*g;
+                    float denom = 1.0 + g_sq + 2.0*g*cos_theta;
+                    return 0.07957747154*(1.0 - g_sq)/(denom*sqrt(denom));
+                }
+
+                float HenyeyGreensteinPhase(float g, vec3 view, vec3 light)
+                {
+                    float cos_theta = dot(view, light);
+                    return HenyeyGreensteinPhase(g, cos_theta);
+                }
+
+                vec3 SampleHenyeyGreenstein(vec3 out_light, float g, vec2 r)
+                {
+                    float cos_theta;
+                    if(abs(g) < 1e-3)
+                        cos_theta = 1.0 - 2.0 * r[0];
+                    else
+                    {
+                        float sqr = (1.0 - g * g) / (1.0 - g + 2.0 * g * r[0]);
+                        cos_theta = (1.0 + g * g - sqr * sqr) / (2.0 * g);
+                    } 
+
+                    float sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+                    float phi = 2.0 * pi * r[1];
+
+                    vec3 tvec, bvec;
+                    BuildOrthoBasisDuff(out_light, tvec, bvec);
+
+                    float sin_phi = sin(phi);
+                    float cos_phi = cos(phi);
+
+                    vec3 inc_light = sin_theta * cos_phi * tvec +
+                                     sin_theta * sin_phi * bvec +
+                                     -cos_theta * out_light;
+                    
+                    return inc_light; // HenyeyGreensteinPhase(-cos_theta, g))
+                }
+
+                // Adapted from
+                // https://www.shadertoy.com/view/4tXyWN
+                uint hash2d(uvec2 x)
+                {
+                    uvec2 q = 1103515245U * ((x>>1U) ^ (x.yx));
+                    uint  n = 1103515245U * ((q.x) ^ (q.y>>3U));
+                    return n;
+                }
+
+                // Murmur hash variant
+                uint murmur32(uint k)
+                {
+                    k *= 0xCC9E2D51u;
+                    k = (k << 15u) | (k >> 17u);
+                    k *= 0x1B873593u;
+                    return k;
+                }
+
+                uint hash3d(uvec3 val)
+                {
+                    uint h = murmur32(val.x);
+                    h = (h << 13u) | (h >> 19u);
+                    h = h * 5u + 0xE6546B64u;
+                    h ^= murmur32(val.y);
+                    h = (h << 13u) | (h >> 19u);
+                    h = h * 5u + 0xE6546B64u;
+                    h ^= murmur32(val.z);
+                    h = (h << 13u) | (h >> 19u);
+                    h = h * 5u + 0xE6546B64u;
+                    h ^= 12u;
+                    h ^= h >> 16u;
+                    h *= 0x85EBCA6Bu;
+                    h ^= h >> 13u;
+                    h *= 0xC2B2AE35u;
+                    h ^= h >> 16u;
+                    return h;
+                }
+
+                // cheap random number generator for the inner loop of the integrator
+                float intel_rand(inout uint seed)
+                {
+                    seed = (214013u * seed + 2531011u);
+                    return float((seed >> 16) & 0x7FFFu) / float(0x7FFFu);
+                }
+
+                // Sign function ignoring zero
+                float SimpleSign(float x)
+                {
+                    return x >= 0.0 ? 1.0 : -1.0;
+                }
+
+                // 3-space sign function ignoring zero
+                vec3 SimpleSign(vec3 val)
+                {
+                    return vec3(SimpleSign(val.x), SimpleSign(val.y), SimpleSign(val.z));
+                }
+
+                // Absolute value squared of a 3-space vector
+                float LengthSquared(vec3 val)
+                {
+                    return dot(val, val);
+                }
+
+                ////////////////////
+                // Scene geometry //
+                ////////////////////
+                // Ray-sphere intersection
+                
+                float IntersectSphereOcclusion(vec3 ray_org, vec3 ray_dir, vec4 sphere)
+                {
+                    float radius = sphere.w;
+                    // center ray origin to sphere
+                    vec3 dist_to_center = sphere.xyz - ray_org;
+
+                    // compute projected distances
+                    float b = dot(dist_to_center, ray_dir);
+                    float c = dot(dist_to_center, dist_to_center) - radius*radius;
+                    // solve quadratic
+                    float D = b*b - c /* * dot(ray_dir, ray_dir) */;
+                    if(D < 0.0 || b < 0.0)
+                        return MAX_DISTANCE;
+
+                    float sqrt_D = sqrt(D);
+                    float t = b - sqrt_D;
+                    // handle corner cases when ray is inside sphere
+                    if(t < 0.0)
+                        t = t < -2.0 * radius ? MAX_DISTANCE : 0.0;
+
+                    return t;
+                }
+
+                // Scene geometry sampling function
+                float SampleGeometry(vec3 ray_org, vec3 ray_dir)
+                {
+                #if USE_GOBO
+                    vec4 spheres[4] = vec4[4](
+                        vec4(0.3, 1.4, -6, 0.12),
+                        vec4(0.4, 0.8, -6, 0.14),
+                        vec4(0.6, 0.4, -6, 0.11),
+                        vec4(0.4, 0.0, -6, 0.14)
+                    );
+
+                    float distance = MAX_DISTANCE;
+                    for(uint sphere_idx = 0u; sphere_idx < 4u; sphere_idx++)
+                    {
+                        float dist_sphere = max(0.0, IntersectSphereOcclusion(ray_org, ray_dir, spheres[sphere_idx]));
+                        distance = min(dist_sphere, distance);
+                    }
+
+                    return distance;
+                #else
+                    float dist_sphere = IntersectSphereOcclusion(ray_org, ray_dir, SpherePosition);
+                    return max(0.0, dist_sphere);
+                #endif
+                }
+
+                //////////
+                // Gobo //
+                //////////
+
+            #if USE_GOBO
+                bool IsInsideGobo(vec4 gobo_pos_radius, vec3 pos_start, vec3 light_dir)
+                {
+                    vec3 gobo_pos = gobo_pos_radius.xyz;
+                    float gobo_radius = gobo_pos_radius.w;
+
+                    vec3 plane_pos_start = pos_start + dot((gobo_pos - pos_start), light_dir) * light_dir;
+                    vec3 dist_to_center = gobo_pos - plane_pos_start;
+
+                    return dot(dist_to_center, dist_to_center) < gobo_radius * gobo_radius;
+                }
+
+                // Compute distance to a infinite cylinder
+                vec2 DistanceToGobo(vec4 gobo_pos_radius, vec3 pos_start, vec3 ray_dir, vec3 light_dir)
+                {
+                    vec3 gobo_pos = gobo_pos_radius.xyz;
+                    float gobo_radius = gobo_pos_radius.w;
+
+                    // project on plane
+                    vec3 plane_pos_start = pos_start + dot((gobo_pos - pos_start), light_dir) * light_dir;
+                    vec3 plane_ray_dir = ray_dir - dot(ray_dir, light_dir) * light_dir;
+
+                    // center to circle center
+                    vec3 dist_to_center = gobo_pos - plane_pos_start;
+
+                    // projected distances
+                    float b = dot(dist_to_center, plane_ray_dir);
+                    float c = dot(dist_to_center, dist_to_center) - gobo_radius * gobo_radius;
+                    float a = dot(plane_ray_dir, plane_ray_dir);
+
+                    // solve quadratic
+                    float D = b*b - c*a;
+
+                    if(a == 0.0)
+                        return vec2(-MAX_DISTANCE, MAX_DISTANCE);
+
+                    if(D < 0.0)
+                        return vec2(0, 0);
+
+                    float sqrt_D = sqrt(D);
+                    float low_t = (b - sqrt_D) / a;
+                    float high_t = (b + sqrt_D) / a;
+
+                    return vec2(low_t, high_t);
+                }
+            #endif
+
+            #if USE_GOBO && MULTIPLE_SCATTERING
+                #define GOBO_DECLARATION , vec4 gobo_pos_radius 
+                #define GOBO_ARGUMENT , gobo_pos_radius
+            #else
+                #define GOBO_DECLARATION
+                #define GOBO_ARGUMENT
+            #endif
+
+                /////////////////////////////////////////////////////////////////////////////////////////////////////////
+                // Monte Carlo Box integrator (MCWVDS)
+                /////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+                // Compute projected distance traversed against a light plane
+                // Combines ComputeProgress with safety checks
+                float IntersectRayAlongVectorAgainstPlane(vec3 ray_org, vec3 ray_dir, vec3 intersection_point, vec3 norm)
+                {
+                    float denom = dot(ray_dir, norm);
+                    return abs(denom) > 1e-10 ? dot(intersection_point - ray_org, norm) / denom : 0.0;
+                }
+
+                // Add epsilon value when computing step size to avoid singularities
+                vec3 RcpStep(vec3 val)
+                {
+                    vec3 step = val + SimpleSign(val)*1e-30;
+                    return vec3(1.0/step.x, 1.0/step.y, 1.0/step.z);
+                }
+
+                // Compute projected progress along x-axis in skewed coordinate system
+                // with x-axis (ray_dir) and orthogonal vector to the y-axis (norm)
+                // when traversing vector (face_vector).
+                // See 'Projected distance along the camera ray' from supplemental
+                // material for more details.
+                float ComputeProgress(vec3 ray_dir, vec3 face_dir, vec3 norm)
+                {
+                    float distance = dot(face_dir, norm) / dot(ray_dir, norm);
+                    return distance;
+                }
+
+                // Finds first intersection with box when the origin lies
+                // inside the box. Refer to Appendix A for slab test explanation
+                vec4 IntersectFaceInBoxSpace(vec3 box_ray_org, vec3 box_ray_dir)
+                {
+                    // handle degenerate cases through masking
+                    bvec3 mask_comp       = equal(box_ray_dir, vec3(0.0));
+                    vec3  box_inv_ray_dir = mix(1.0 / box_ray_dir, vec3(0.0f), mask_comp);
+
+                    // Technically abs can be faster but inf - inf is NaN...
+                    vec3 box_upper = (vec3(1.0) - box_ray_org) * box_inv_ray_dir;
+                    vec3 box_lower = (vec3(-1.0) - box_ray_org) * box_inv_ray_dir;
+
+                    vec3 box_tmax3 = max(box_lower, box_upper);
+                    // final masking of degenerate case
+                    box_tmax3 += vec3(mask_comp) * MAX_DISTANCE;
+
+                    float box_tmax = max(0.0, MinComponent(box_tmax3));
+
+                    vec3 point_in_box = box_ray_org + box_tmax * box_ray_dir;
+                    return vec4(point_in_box.x, point_in_box.y, point_in_box.z, box_tmax);
+                }
+
+                // Compute distance from start point to the closest plane at
+                // +-1 along the direction (walk_dir) and excluding specific
+                // directions from the computation
+                float ComputeWalkDistance(vec3 start, vec3 walk_dir, vec3 weight)
+                {
+                    vec3 rcp_walk_dir = RcpStep(walk_dir);
+                    vec3 walk_dist3 = (SimpleSign(walk_dir) - start)*rcp_walk_dir;
+                    walk_dist3 += weight * 1e32;
+                    return MinComponent(walk_dist3);
+                }
+
+                // Compute face vectors formed by the intersection of a light-view plane against
+                // the box (ALGORITHM 2: Computing face vectors for a given axis)
+                void ComputeFaceVectors(vec3 box_ray_dir, vec3 box_light_view_norm, vec3 box_transverse_norm, out vec3 face_vectors[3])
+                {
+                    // Compute direction for each axis
+                    face_vectors[0] = cross(vec3(1.0, 0.0, 0.0), box_light_view_norm);
+                    face_vectors[1] = cross(vec3(0.0, 1.0, 0.0), box_light_view_norm);
+                    face_vectors[2] = cross(vec3(0.0, 0.0, 1.0), box_light_view_norm);
+                    
+                    // Compute direction of progress along the camera ray
+                    vec3 improvement = vec3(
+                        ComputeProgress(box_ray_dir, face_vectors[0], box_transverse_norm),
+                        ComputeProgress(box_ray_dir, face_vectors[1], box_transverse_norm),
+                        ComputeProgress(box_ray_dir, face_vectors[2], box_transverse_norm)
+                    );
+                    
+                    for(uint idx = 0u; idx < 3u; idx++)
+                    {
+                        // handle parallel cases
+                        float progress = abs(improvement[idx]) > 1e-4 ? improvement[idx] : dot(face_vectors[idx], box_ray_dir);
+                        // apply sign
+                        face_vectors[idx] = face_vectors[idx] * progress;
+                    }
+                }
+
+                // Handle initial degenerate cases when light vector is parallel to a box face
+                bvec3 ComputeInitMask(vec3 box_light_dir, in vec3 face_vectors[3])
+                {
+                    vec3 corr_face_vectors_sq = vec3(dot(box_light_dir, face_vectors[0]), //
+                                                     dot(box_light_dir, face_vectors[1]), //
+                                                     dot(box_light_dir, face_vectors[2]));
+                    corr_face_vectors_sq *= corr_face_vectors_sq;
+
+                    vec3 face_vector_lengths_sq =
+                      vec3(LengthSquared(face_vectors[0]), LengthSquared(face_vectors[1]),
+                           LengthSquared(face_vectors[2]));
+                    float box_light_dir_length_sq = dot(box_light_dir, box_light_dir);
+                    vec3  sq_lengths              = box_light_dir_length_sq * face_vector_lengths_sq;
+                    vec3  cos_sq_diff             = abs(corr_face_vectors_sq - sq_lengths);
+                    bvec3 init_mask               = lessThan(cos_sq_diff, vec3(1e-6f) * sq_lengths);
+                    return init_mask;
+                }
+
+                // Select direction of traversal based on current position on the boundary of the box
+                // ALGORITHM 3: Selecting the direction of traversal and computing next corner
+                vec3 SelectDirection(vec3 pos, bvec3 mask, in vec3 face_vectors[3])
+                {
+                    // choose first axis
+                    uint chosen_idx = 0u;
+
+                    // Determine current face pair
+                    bvec3 walk_face = greaterThan(abs(pos), vec3(0.9999f));
+                    for(uint idx = 1u; idx < 3u; idx++)
+                    {
+                        // compute sign of face vector
+                        vec3 s = sign(face_vectors[idx]);
+                        // apply sign
+                        vec3 weighted_axis = s * pos;
+                        // choose direction if it can do progress along the face
+                        if(walk_face[idx] && !mask[idx] && all(lessThan(weighted_axis, vec3(0.9999f))))
+                            chosen_idx = idx;
+                    }
+
+                    // take the chosen face vector
+                    vec3 dir = face_vectors[chosen_idx];
+                    // remove current axis component
+                    mask      = equal(vec3(float(chosen_idx)), vec3(0, 1, 2));
+                    vec3 axis = vec3(mask);
+
+                    // determine distance traversed along face vector
+                    dir *= ComputeWalkDistance(pos, dir, axis);
+                    return dir;
+                }
+
+                // Compute radiance for a trapezoid segment
+                // ALGORITHM 5: Computing the radiance of a constrained trapezoid section
+                float ComputeIntegralBoundedTermCache(float cam_start, float cam_end, float cam_surface, float distance_to_edge,
+                                                	  float distance_at_end, out float exp_upper, out vec4 cached_values)
+                {
+                    // constrain to surface
+                    float t_bound = clamp(cam_surface, cam_start, cam_end);
+                    float dist = cam_end - cam_start;
+
+                    // distance to bound end
+                    float actual_dist = t_bound - cam_start;
+                    // common/linear interpolation factor
+                    float denom = 1.0 + (distance_at_end - distance_to_edge) / dist;
+
+                    // denom
+                    float factor_at_third = Extinction * denom;
+                    // integral upper bound part 
+                    exp_upper = exp(-Extinction * actual_dist * (dist != 0.0 ? denom : 0.0));
+
+                    // parentheses part
+                    float inv_exp_upper = 1.0 - exp_upper;
+                    float integral_num = inv_exp_upper;
+
+                    // cached values
+                    cached_values.x = inv_exp_upper;
+                    cached_values.y = factor_at_third;
+                    cached_values.z = actual_dist;
+                    cached_values.w = cam_start;
+
+                    // integral solution and avoiding case when it becomes singular due to constant integrand
+                    return abs(denom) > 1e-7 && dist > 1e-7 ? integral_num / factor_at_third : actual_dist;
+                }
+
+                // Sampling function computed using cached values
+                float InverseComputeIntegralBoundedTermCached(float r, vec4 cached_values)
+                {
+                    float t = - log(1.0 - cached_values.x * r) / cached_values.y;
+                 
+                    // avoids constant integral singular value
+                    float t_final = abs(cached_values.y) > 1e-7 && cached_values.z > 1e-7 ? t : cached_values.z * r;
+                    return cached_values.w + t_final;
+                }
+
+
+                // Our optimized Monte Carlo integrator (MCWVGC)
+                // ALGORITHM 7: Optimized Monte Carlo integration algorithm based on variable caching
+                #if SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING
+                vec3 MonteCarloWholeVolumeSampling(mat4x3 world_to_box,
+                                                   vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound, vec3 light_dir, vec3 light_color)
+                {
+                    // Transform ray origin to box coordinates
+                    vec3 box_ray_org = vec3(world_to_box * vec4(ray_org, 1.0));
+
+                    // Transform ray direction to box coordinates
+                    vec3 box_ray_dir = vec3(world_to_box * vec4(ray_dir, 0.0));
+
+                    // Transform light ray direction to box coordinates
+                    vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+                    
+                    // Compute exit point along camera ray
+                    vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                    vec3 box_dest = vec3(box_dest_t.xyz);
+                    float t_dest = box_dest_t.w;
+                    
+                    // Compute exit point along light ray from camera origin
+                    vec4 box_start_t = IntersectFaceInBoxSpace(box_ray_org, box_light_dir);
+                    vec3 box_start = vec3(box_start_t.xyz);
+                    float t_start = box_start_t.w;
+
+                    // Compute light-view plane normal
+                    vec3 plane_normal = cross(ray_dir, light_dir);
+                    float plane_normal_sqr_mag = LengthSquared(plane_normal);
+                    
+                    // Handle parallel corner case
+                    vec4 cache[3];
+                    float exp_upper;
+                    float t_bound = min(t_dest, ray_dir_upper_bound);
+
+                    float exp_lower = exp(-Extinction * t_start);
+                    float distance_at_end = dot(ray_dir, light_dir) > 0.0 ? 0.0 : t_dest + t_start;
+                    float integral_parallel = exp_lower * ComputeIntegralBoundedTermCache(0.0, t_dest, ray_dir_upper_bound,
+			                                                                              t_start, distance_at_end, exp_upper, cache[0]);
+                    vec3 integral_histogram = vec3(integral_parallel, 0, 0);
+
+                    // Re-scale factors from box to world coordinates with extra re-scaling
+                    vec3 sqr_scale = vec3(1.0/LengthSquared(vec3(world_to_box * vec4(1, 0, 0, 0))),
+                                          1.0/LengthSquared(vec3(world_to_box * vec4(0, 1, 0, 0))),
+                                          1.0/LengthSquared(vec3(world_to_box * vec4(0, 0, 1, 0))));
+                    
+                    // light dir with baked in scale
+                    vec3 sqr_scale_box_light_dir = sqr_scale*box_light_dir;
+                    
+                    // light-view normal in box coordinates
+                    vec3 box_light_view_norm = cross(box_ray_dir, box_light_dir);
+
+                    // light plane normal in box coordinates
+                    vec3 box_transverse_norm = cross(box_light_view_norm, box_light_dir);
+                    
+                    // precomputed face vectors on each pair of box faces
+                    vec3 face_vectors[3];
+                    ComputeFaceVectors(box_ray_dir, box_light_view_norm, box_transverse_norm, face_vectors);
+                    
+                    float t_segment_start = 0.0;
+                    vec3 end_point = box_start;
+                    float distance_to_start = t_start;
+
+                    bvec3 init_mask = ComputeInitMask(box_light_dir, face_vectors);
+
+                    // avoid parallel cases
+                    bool continue_comp = plane_normal_sqr_mag > 1e-12;
+                    if(continue_comp)
+                    {
+                        // cache collection loop
+                        for (uint face_idx = 0u; face_idx < 3u; face_idx++)
+                        {
+                            // select next direction
+                            vec3 next_vec = SelectDirection(end_point, init_mask, face_vectors);
+
+                            // walk to next corner
+                            float cut_point = IntersectRayAlongVectorAgainstPlane(end_point, next_vec, box_dest, box_transverse_norm);
+                            cut_point = clamp(cut_point, 0.0, 1.0);
+                            end_point += cut_point * next_vec;
+
+                            float t_segment_end = IntersectRayAlongVectorAgainstPlane(box_ray_org, box_ray_dir, end_point, box_transverse_norm);
+
+                            // compute the next point
+                            vec3 dest_point = box_ray_org + t_segment_end * box_ray_dir;
+                            float distance_at_end = dot(end_point - dest_point, sqr_scale_box_light_dir);
+
+                            // cache unoccluded radiance and values
+                            float integral_segment = exp_lower * ComputeIntegralBoundedTermCache(
+                                t_segment_start, t_segment_end, ray_dir_upper_bound,
+                                distance_to_start, distance_at_end, exp_upper, cache[face_idx]);
+                            distance_to_start = distance_at_end;
+                            // accumulate attenuation
+                            exp_lower *= exp_upper;
+
+                            // assign start of next segment
+                            t_segment_start = t_segment_end;
+
+                            // cache unoccluded radiance per segment
+                            integral_histogram[face_idx] = integral_segment;
+                        }
+                    }
+                    
+                    // build histogram from data per segment
+                    integral_histogram.y += integral_histogram.x;
+                    integral_histogram.z += integral_histogram.y;
+                    
+                    float integral = integral_histogram.z;
+
+                    integral_histogram /= integral_histogram.z;
+                    
+                    // build segment transformations
+                    vec3 len_norm = vec3(integral_histogram.x,
+                                         integral_histogram.y - integral_histogram.x,
+                                         integral_histogram.z - integral_histogram.y);
+                    vec4 integral_denoms = vec4(len_norm.x > 0.0 ? 1.0 / len_norm.x : 1.0,
+                                                len_norm.y > 0.0 ? 1.0 / len_norm.y : 1.0,
+                                                len_norm.z > 0.0 ? 1.0 / len_norm.z : 1.0,
+                                                integral_histogram.x);
+                    
+                    vec4 integral_summands = vec4(0.0, -integral_histogram.x * integral_denoms.y, - integral_histogram.y * integral_denoms.z, integral_histogram.y);
+                    
+                    float total_visibility = 0.0;
+
+                    float rcp_SampleCount = 1.0 / float(SampleCount);
+
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+
+                    // integration loop
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        // jitter random values
+                        float n = GENERATE_RANDOM_SAMPLE(seed);
+                        float random_value = (float(idx) + n) * rcp_SampleCount;
+                        
+                        // select segment
+                        uint segment = uint(random_value > integral_denoms.w) + uint(random_value > integral_summands.w);
+                        
+                        // transform to segment domain
+                        float random_value_scaled = random_value * integral_denoms[segment] + integral_summands[segment];
+                        
+                        // compute distance
+                        float t = InverseComputeIntegralBoundedTermCached(random_value_scaled, cache[segment]);
+                        t = clamp(t, 0.0, t_bound);
+
+                        // sample visibility
+                        float visibility = float(SampleGeometry(ray_org + t * ray_dir, light_dir) == MAX_DISTANCE);
+
+                        // accumulate visibility
+                        total_visibility += visibility;
+                    }
+
+                    // apply visibility to unshadowed integral to follow the Monte Carlo algorithm
+                    integral *= total_visibility * rcp_SampleCount;
+
+                    float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(ray_dir, light_dir));
+                    vec3 radiance = integral * hg_phase * ScatteringCoef;
+                    
+                    return radiance * light_color;
+                }
+
+                #define GenerateDistanceSample WVDSGenerateDistanceSample
+                #define ComputeThroughputWeight WVDSComputeThroughputWeight
+                #define ComputeLightTransmittanceWeight WVDSComputeLightTransmittanceWeight
+
+                #if MULTIPLE_SCATTERING && USE_GOBO
+                #   define GenerateMSDistanceSample DSGenerateDistanceSample
+                #   define ComputeMSThroughputWeight(w, dist_sampling_data) DSComputeThroughputWeight(dist_sampling_data) 
+                #else
+                #   define GenerateMSDistanceSample WVDSGenerateDistanceSample
+                #   define ComputeMSThroughputWeight WVDSComputeMSThroughputWeight
+                #endif
+
+                vec4 WVDSGenerateDistanceSample(float random_value, float t_bound, float t_dest, vec3 ray_dir, vec3 light_dir,
+                                                mat4x3 world_to_box, vec3 box_ray_org, vec3 box_ray_dir, vec3 box_light_dir, vec3 box_dest)
+                {
+                    // Compute exit point along light ray from camera origin
+                    vec4 box_start_t = IntersectFaceInBoxSpace(box_ray_org, box_light_dir);
+                    vec3 box_start = vec3(box_start_t.xyz);
+                    float t_start = box_start_t.w;
+
+                    // Compute light-view plane normal
+                    vec3 plane_normal = cross(ray_dir, light_dir);
+                    float plane_normal_sqr_mag = LengthSquared(plane_normal);
+                    
+                    // Handle parallel corner case
+                    vec4 cache[3];
+                    float exp_upper;
+
+                    float exp_lower = exp(-Extinction * t_start);
+                    float distance_at_end = dot(ray_dir, light_dir) > 0.0 ? 0.0 : t_dest + t_start;
+                    float integral_parallel = exp_lower * ComputeIntegralBoundedTermCache(0.0, t_dest, t_bound,
+                                                                                        t_start, distance_at_end, exp_upper, cache[0]);
+                    vec3 integral_histogram = vec3(integral_parallel, 0, 0);
+
+                    // Re-scale factors from box to world coordinates with extra re-scaling
+                    vec3 sqr_scale = vec3(1.0/LengthSquared(vec3(world_to_box * vec4(1, 0, 0, 0))),
+                                        1.0/LengthSquared(vec3(world_to_box * vec4(0, 1, 0, 0))),
+                                        1.0/LengthSquared(vec3(world_to_box * vec4(0, 0, 1, 0))));
+                    
+                    // light dir with baked in scale
+                    vec3 sqr_scale_box_light_dir = sqr_scale*box_light_dir;
+                    
+                    // light-view normal in box coordinates
+                    vec3 box_light_view_norm = cross(box_ray_dir, box_light_dir);
+
+                    // light plane normal in box coordinates
+                    vec3 box_transverse_norm = cross(box_light_view_norm, box_light_dir);
+                    
+                    // precomputed face vectors on each pair of box faces
+                    vec3 face_vectors[3];
+                    ComputeFaceVectors(box_ray_dir, box_light_view_norm, box_transverse_norm, face_vectors);
+                    
+                    float t_segment_start = 0.0;
+                    vec3 end_point = box_start;
+                    float distance_to_start = t_start;
+
+                    bvec3 init_mask = ComputeInitMask(box_light_dir, face_vectors);
+
+                    // avoid parallel cases
+                    bool continue_comp = plane_normal_sqr_mag > 1e-12;
+                    if(continue_comp)
+                    {
+                        // cache collection loop
+                        for (uint face_idx = 0u; face_idx < 3u; face_idx++)
+                        {
+                            // select next direction
+                            vec3 next_vec = SelectDirection(end_point, init_mask, face_vectors);
+
+                            // walk to next corner
+                            float cut_point = IntersectRayAlongVectorAgainstPlane(end_point, next_vec, box_dest, box_transverse_norm);
+                            cut_point = clamp(cut_point, 0.0, 1.0);
+                            end_point += cut_point * next_vec;
+
+                            float t_segment_end = IntersectRayAlongVectorAgainstPlane(box_ray_org, box_ray_dir, end_point, box_transverse_norm);
+
+                            // compute the next point
+                            vec3 dest_point = box_ray_org + t_segment_end * box_ray_dir;
+                            float distance_at_end = dot(end_point - dest_point, sqr_scale_box_light_dir);
+
+                            // cache unoccluded radiance and values
+                            float integral_segment = exp_lower * ComputeIntegralBoundedTermCache(
+                                t_segment_start, t_segment_end, t_bound,
+                                distance_to_start, distance_at_end, exp_upper, cache[face_idx]);
+                            distance_to_start = distance_at_end;
+                            // accumulate attenuation
+                            exp_lower *= exp_upper;
+
+                            // assign start of next segment
+                            t_segment_start = t_segment_end;
+
+                            // cache unoccluded radiance per segment
+                            integral_histogram[face_idx] = integral_segment;
+                        }
+                    }
+                    
+                    // build histogram from data per segment
+                    integral_histogram.y += integral_histogram.x;
+                    integral_histogram.z += integral_histogram.y;
+                    
+                    float unoccluded_integral = integral_histogram.z;
+
+                    integral_histogram /= integral_histogram.z;
+                    
+                    // build segment transformations
+                    vec3 len_norm = vec3(integral_histogram.x,
+                                        integral_histogram.y - integral_histogram.x,
+                                        integral_histogram.z - integral_histogram.y);
+                    vec4 integral_denoms = vec4(len_norm.x > 0.0 ? 1.0 / len_norm.x : 1.0,
+                                                len_norm.y > 0.0 ? 1.0 / len_norm.y : 1.0,
+                                                len_norm.z > 0.0 ? 1.0 / len_norm.z : 1.0,
+                                                integral_histogram.x);
+                    
+                    vec4 integral_summands = vec4(0.0, -integral_histogram.x * integral_denoms.y, - integral_histogram.y * integral_denoms.z, integral_histogram.y);
+                    
+                    // select segment
+                    uint segment = uint(random_value > integral_denoms.w) + uint(random_value > integral_summands.w);
+                    
+                    // transform to segment domain
+                    float random_value_scaled = random_value * integral_denoms[segment] + integral_summands[segment];
+                    
+                    // compute distance
+                    float t = InverseComputeIntegralBoundedTermCached(random_value_scaled, cache[segment]);
+                    t = clamp(t, 0.0, t_bound);
+
+                    vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+                    vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                    float t_light = box_t.y;
+
+                    return vec4(t, unoccluded_integral, t_light, 0.0);
+                }
+
+                vec3 WVDSComputeThroughputWeight(vec4 dist_sampling_data)
+                {
+                    float unoccluded_integral = dist_sampling_data.y;
+                    return ScatteringCoef * unoccluded_integral;
+                }
+
+                vec3 WVDSComputeMSThroughputWeight(vec3 throughput_weight, vec4 dist_sampling_data)
+                {
+                    float t_light = dist_sampling_data.z;
+                    return throughput_weight * exp(Extinction * t_light);
+                }
+
+                float WVDSComputeLightTransmittanceWeight(float t_light)
+                {
+                    return 1.0;
+                }
+                #endif
+
+                //////////////////////////////////
+                // Ray marching integrator (RM) //
+                //////////////////////////////////
+
+                // Ray marching
+                // Supplemental material II
+                // ALGORITHM 1: Single-scattering integrator using ray marching algorithm
+                #if SELECTED_INTEGRATOR == RAY_MARCHING
+                vec3 RayMarchingIntegrator(mat4x3 world_to_box,
+                                           vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound, vec3 light_dir, vec3 light_color)
+                {
+                    // Convert ray origin to box coordinates
+                    vec3 box_ray_org = vec3(world_to_box * vec4(ray_org, 1.0));
+
+                    // Convert ray direction to box coordinates
+                    vec3 box_ray_dir = vec3(world_to_box * vec4(ray_dir, 0.0));
+
+                    // Convert light direction to box coordinates
+                    vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                    // Compute distance to exit point along camera ray
+                    vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                    vec3 box_dest = vec3(box_dest_t.xyz);
+                    float t_dest = box_dest_t.w;
+
+                    // Clip distance along camera ray by distance to surface
+                    float t_bound = min(t_dest, ray_dir_upper_bound);
+
+                    float integral = 0.0;
+
+                    float rcp_SampleCount = 1.0 / float(SampleCount);
+
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+
+                    // integration loop
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        // jitter random values
+                        float n = GENERATE_RANDOM_SAMPLE(seed);
+                        float random_value = (float(idx) + n) * rcp_SampleCount;
+                        
+                        // generate distance
+                        float t = t_bound * random_value;
+
+                        // compute point
+                        vec3 ray_point = ray_org + t * ray_dir;
+
+                        // intersect scene geometry
+                        float dist_geometry = SampleGeometry(ray_point, light_dir);
+
+                        // compute visibility
+                        float visibility = float(dist_geometry == MAX_DISTANCE);
+
+                        // use slab test to compute distance to exit point from medium
+                        vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+
+                        vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                        float t_light = box_t.y;
+
+                        // integrate values
+                        integral += visibility * exp(-Extinction * (t_light + t));
+                    }
+
+                    // weight by distance (1/PDF)
+                    integral *= t_bound * rcp_SampleCount;
+
+                    float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(ray_dir, light_dir));
+                    vec3 radiance = integral * hg_phase * ScatteringCoef;
+
+                    return radiance * light_color;
+                }
+                #endif
+
+                #if MULTIPLE_SCATTERING && (SELECTED_INTEGRATOR == RAY_MARCHING || SELECTED_INTEGRATOR == RATIO_ESTIMATOR)
+                #define GenerateDistanceSample RMGenerateDistanceSample 
+                #define GenerateMSDistanceSample RMGenerateDistanceSample 
+                #define ComputeThroughputWeight RMComputeThroughputWeight
+                #define ComputeMSThroughputWeight RMComputeMSThroughputWeight
+                #define ComputeLightTransmittanceWeight RMComputeLightTransmittanceWeight
+
+                vec4 RMGenerateDistanceSample(float random_value, float t_bound, float t_dest, vec3 ray_dir, vec3 light_dir,
+                                              mat4x3 world_to_box, vec3 box_ray_org, vec3 box_ray_dir, vec3 box_light_dir, vec3 box_dest)
+                {
+                    // spread following distance sampling strategy
+                    float t = t_bound * random_value;
+                    float cam_transmittance = exp(-Extinction * t);
+                    float weighted_trans = cam_transmittance * t_bound;
+
+                    // intersect box to determine distance to exit point along light ray
+                    vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+                    vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                    float t_light = box_t.y;
+
+                    return vec4(t, weighted_trans, t_light, 0.0);
+                }
+
+                vec3 RMComputeThroughputWeight(vec4 dist_sampling_data)
+                {
+                    float weighted_trans = dist_sampling_data.y;
+                    return ScatteringCoef * weighted_trans; // cancels HG term
+                }
+
+                vec3 RMComputeMSThroughputWeight(vec3 throughput_weight, vec4 dist_sampling_data)
+                {
+                    return throughput_weight;
+                }
+
+                float RMComputeLightTransmittanceWeight(float t_light)
+                {
+                    return exp(-Extinction * t_light);
+                }
+                #endif
+
+                // Uncached version trapezoid segment unoccluded radiance integration
+                // ALGORITHM 5: Computing the radiance of a constrained trapezoid section
+                float ComputeIntegralBoundedTerm(float cam_start, float cam_end, float cam_surface, float distance_to_edge,
+                                 float distance_at_end, out float exp_upper)
+                {
+                    // bound to surface
+                    float t_bound = clamp(cam_surface, cam_start, cam_end);
+
+                    // segment length
+                    float dist = cam_end - cam_start;
+                    
+                    // compute distance to bounded end
+                    float actual_dist = t_bound - cam_start;
+
+                    // linear interpolation/common factor
+                    float denom = 1.0 + (distance_at_end - distance_to_edge) / dist;
+                    
+                    // denominator
+                    float factor_at_third = Extinction * denom;
+
+                    // integral upper bound part
+                    exp_upper = exp(-Extinction * actual_dist * (dist != 0.0 ? denom : 0.0));
+                    float integral_num = (1.0 - exp_upper);
+
+                    // compute integral and avoid corner case when the integrand becomes constant
+                    return (abs(denom) > 1e-7 && dist > 1e-7) ? (integral_num / factor_at_third) : actual_dist;
+                }
+
+                // Unoccluded radiance integral
+                // ALGORITHM 7: Optimized Monte Carlo integration algorithm based on variable caching 
+                float BoxSliceIntegrateUnoccluded(mat4x3 world_to_box, 
+                                                  vec3 box_ray_org, vec3 box_ray_dir, vec3 box_light_dir, float ray_dir_upper_bound,
+                                                  vec4 box_dest_t)
+                {
+                    // take components out
+                    vec3 box_dest = box_dest_t.xyz;
+                    float t_dest = box_dest_t.w;
+
+                    // compute intersection from camera origin along light ray
+                    vec4 box_start_t = IntersectFaceInBoxSpace (box_ray_org, box_light_dir);
+                    vec3 box_start = box_start_t.xyz;
+                    float t_start = box_start_t.w;
+                    
+                    // light-view normal vector
+                    vec3 plane_normal = cross(box_ray_dir, box_light_dir);
+                    float plane_normal_sqr_mag = LengthSquared(plane_normal);
+
+                    // lower bound integral part
+                    float exp_lower = exp(-Extinction * t_start);
+
+                    float integral = 0.0;
+
+                    // handle parallel case
+                    if (plane_normal_sqr_mag < 1e-12)
+                    {
+                        float exp_upper;
+                        float distance_at_end = dot(box_ray_dir, box_light_dir) > 0.0 ? 0.0 : t_dest + t_start;
+                        integral = exp_lower * ComputeIntegralBoundedTerm(0.0, t_dest, ray_dir_upper_bound,
+                            t_start, distance_at_end, exp_upper);
+                        return integral;
+                    }
+                    
+                    // squared scale factor back to world coordinates
+                    vec3 sqr_scale = vec3(1.0/LengthSquared(vec3(world_to_box * vec4(1, 0, 0, 0))),
+                                          1.0/LengthSquared(vec3(world_to_box * vec4(0, 1, 0, 0))),
+                                          1.0/LengthSquared(vec3(world_to_box * vec4(0, 0, 1, 0))));
+                    
+                    // scaled back box 
+                    vec3 sqr_scale_box_light_dir = sqr_scale*box_light_dir;
+                    
+                    // light-view plane normal
+                    vec3 box_light_view_norm = cross(box_ray_dir, box_light_dir);
+
+                    // light plane normal
+                    vec3 box_transverse_norm = cross(box_light_view_norm, box_light_dir);
+                    
+                    // pre-compute face vectors
+                    vec3 face_vectors[3];
+                    ComputeFaceVectors(box_ray_dir, box_light_view_norm, box_transverse_norm, face_vectors);
+                    
+                    // initialize the start points
+                    float t_segment_start = 0.0;
+                    vec3 end_point = box_start;
+                    float distance_to_start = t_start;
+
+                    bvec3 init_mask = ComputeInitMask(box_light_dir, face_vectors);
+
+                    for(uint face_idx = 0u; face_idx < 3u; face_idx++)
+                    {
+                        // select next direction
+                        vec3 next_vec = SelectDirection(end_point, init_mask, face_vectors);
+
+                        // clamp to avoid overstepping over destination point
+                        float cut_point = IntersectRayAlongVectorAgainstPlane(end_point, next_vec, box_dest, box_transverse_norm);
+                        cut_point = clamp(cut_point, 0.0, 1.0);
+                        end_point += cut_point * next_vec;
+
+                        // compute distance between camera ray and box outline at the last corner
+                        float t_segment_end = IntersectRayAlongVectorAgainstPlane(box_ray_org, box_ray_dir, end_point, box_transverse_norm);
+
+                        vec3 dest_point = box_ray_org + t_segment_end * box_ray_dir;
+                        float distance_at_end = dot(end_point - dest_point, sqr_scale_box_light_dir);
+                        
+                        // compute and accumulate radiance for each trapezoid segment
+                        float exp_upper;
+                        integral += exp_lower * ComputeIntegralBoundedTerm(t_segment_start, t_segment_end, ray_dir_upper_bound,
+                                                                           distance_to_start, distance_at_end, exp_upper);
+                        distance_to_start = distance_at_end;
+                        exp_lower *= exp_upper;
+                        t_segment_start = t_segment_end;
+                    }
+
+                    return integral;
+                }
+
+                // Ratio estimator distributing samples equidistantly along the camera ray
+                // Supplemental material II: ALGORITHM 3: Ratio estimator with equidistant sampling single-scattering integration algorithm
+                #if SELECTED_INTEGRATOR == RATIO_ESTIMATOR
+                vec3 RatioEstimatorRayMarchingIntegrator(mat4x3 world_to_box,
+                                                         vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound, vec3 light_dir, vec3 light_color,
+                                                         out vec3 ms_unoccluded_estimate,
+                                                         out vec3 ratio_unoccluded_estimate)
+                {
+                    // compute ray origin in box coordinates
+                    vec3 box_ray_org = vec3(world_to_box * vec4(ray_org, 1.0));
+
+                    // compute light ray direction in non-normalized box coordinates
+                    vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                    // compute ray direction in non-normalized box coordinates
+                    vec3 box_ray_dir = vec3(world_to_box * vec4(ray_dir, 0.0));
+
+                    // compute exit point along camera ray
+                    vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                    vec3 box_dest = vec3(box_dest_t.xyz);
+                    float t_dest = box_dest_t.w;
+
+                    // compute unoccluded radiance
+                    float unoccluded_integral = BoxSliceIntegrateUnoccluded(world_to_box, box_ray_org,
+                                                                            box_ray_dir, box_light_dir, ray_dir_upper_bound, box_dest_t);
+
+                    // limit destination point by distance to surface
+                    float t_bound = min(t_dest, ray_dir_upper_bound);
+
+                    float integral = 0.0;
+
+                    float rcp_SampleCount = 1.0 / float(SampleCount);
+
+                    float est_unoccluded = 0.0;
+
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+
+                    // integration loop
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        // jitter random values
+                        float n = GENERATE_RANDOM_SAMPLE(seed);
+                        float random_value = (float(idx) + n) * rcp_SampleCount;
+                        
+                        // distribute evenly along camera ray
+                        float t = t_bound * random_value;
+
+                        // compute point along camera ray in world coordinates
+                        vec3 ray_point = ray_org + t * ray_dir;
+
+                        // intersect scene geometry and determine visibility
+                        float visibility = float(SampleGeometry(ray_point, light_dir) == MAX_DISTANCE);
+
+                        // compute point along camera ray in box coordinates
+                        vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+
+                        // intersect box to determine distance to exit point along light ray
+                        vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                        float t_light = box_t.y;
+
+                        // compute attenuation according to Beer's law
+                        float att = exp(-Extinction * (t_light + t));
+
+                        // accumulate unoccluded term
+                        est_unoccluded += att;
+
+                        // accumulate occluded term
+                        integral += visibility * att;
+                    }
+
+                    float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(ray_dir, light_dir));
+                    vec3 radiance = integral * hg_phase * ScatteringCoef;
+
+                #if ACCUMULATE_MODE == 0
+                    // apply ratio term and avoid fully occluded cases
+                    if(est_unoccluded > 0.0)
+                        radiance *= unoccluded_integral / est_unoccluded;
+                    else
+                        radiance = vec3(0.0);
+                #else
+                    ms_unoccluded_estimate = vec3(unoccluded_integral);
+                    ratio_unoccluded_estimate = vec3(est_unoccluded);
+                    #if MULTIPLE_LIGHTS
+                        ms_unoccluded_estimate *= light_color * hg_phase * ScatteringCoef;
+                        ratio_unoccluded_estimate *= light_color * t_bound * rcp_SampleCount * hg_phase * ScatteringCoef;
+                        radiance *= t_bound * rcp_SampleCount;
+                    #endif
+                #endif
+
+                    return radiance * light_color;
+                }
+                #endif
+                
+                // Monte Carlo with distance sampling following the classic integration principles
+                // Supplemental material II: ALGORITHM 2: Single-scattering integrator using distance sampling
+                #if SELECTED_INTEGRATOR == DISTANCE_SAMPLING
+                vec3 MonteCarloDistanceSampling(mat4x3 world_to_box,
+                                                vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound, vec3 light_dir, vec3 light_color)
+                {
+                    // compute ray origin in box coordinates
+                    vec3 box_ray_org = vec3(world_to_box * vec4(ray_org, 1.0));
+
+                    // compute ray direction in non-normalized box coordinates
+                    vec3 box_ray_dir = vec3(world_to_box * vec4(ray_dir, 0.0));
+
+                    // compute light ray direction in non-normalized box coordinates
+                    vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                    // compute exit point along camera ray
+                    vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                    vec3 box_dest = vec3(box_dest_t.xyz);
+                    float t_dest = box_dest_t.w;
+
+                    // limit destination point by distance to surface
+                    float t_bound = min(t_dest, ray_dir_upper_bound);
+
+                    float exp_upper = 1.0 - exp(-Extinction * t_bound);
+                    float denom = -1.0 / Extinction;
+
+                    float integral = 0.0;
+
+                    float rcp_SampleCount = 1.0 / float(SampleCount);
+                    
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+
+                    // integration loop
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        // jitter random values
+                        float n = GENERATE_RANDOM_SAMPLE(seed);
+                        float random_value = (float(idx) + n) * rcp_SampleCount;
+                        
+                        // spread following distance sampling strategy
+                        float t = denom * log(1.0 - exp_upper * random_value);
+
+                        // compute point along camera ray in world coordinates
+                        vec3 ray_point = ray_org + t * ray_dir;
+
+                        // intersect scene geometry and determine visibility
+                        float visibility = float(SampleGeometry(ray_point, light_dir) == MAX_DISTANCE);
+
+                        // compute point along camera ray in box coordinates
+                        vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+
+                        // intersect box to determine distance to exit point along light ray
+                        vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                        float t_light = box_t.y;
+
+                        // weight only by transmittance along light path segment
+                        integral += visibility * exp(-Extinction * t_light);
+                    }
+
+                    // apply 1/PDF and weight by sample count
+                    integral *= exp_upper * rcp_SampleCount / Extinction;
+
+                    float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(ray_dir, light_dir));
+                    vec3 radiance = integral * hg_phase * ScatteringCoef;
+
+                    return radiance * light_color;
+                }
+                #endif
+
+            #if MULTIPLE_SCATTERING && (SELECTED_INTEGRATOR == DISTANCE_SAMPLING || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING || \
+                                        (SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING && USE_GOBO))
+                vec4 DSGenerateDistanceSample(float random_value, float t_bound, float t_dest, vec3 ray_dir, vec3 light_dir,
+                                              mat4x3 world_to_box, vec3 box_ray_org, vec3 box_ray_dir, vec3 box_light_dir, vec3 box_dest)
+                {
+                    float exp_upper = 1.0 - exp(-Extinction * t_bound);
+                    float denom = -1.0 / Extinction;
+
+                    // spread following distance sampling strategy
+                    float t = denom * log(1.0 - exp_upper * random_value);
+
+                    // intersect box to determine distance to exit point along light ray
+                    vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+                    vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                    float t_light = box_t.y;
+
+                    return vec4(t, 0.0, t_light, exp_upper);
+                }
+
+                vec3 DSComputeThroughputWeight(vec4 dist_sampling_data)
+                {
+                    float exp_upper = dist_sampling_data.w;
+                    return Albedo * exp_upper; // cancels HG term
+                }
+            #endif
+                
+            #if MULTIPLE_SCATTERING && (SELECTED_INTEGRATOR == DISTANCE_SAMPLING || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING)
+                #define GenerateDistanceSample DSGenerateDistanceSample
+                #define GenerateMSDistanceSample DSGenerateDistanceSample
+                #define ComputeThroughputWeight DSComputeThroughputWeight
+                #define ComputeMSThroughputWeight DSComputeMSThroughputWeight
+                #define ComputeLightTransmittanceWeight DSComputeLightTransmittanceWeight
+
+                vec3 DSComputeMSThroughputWeight(vec3 throughput_weight, vec4 dist_sampling_data)
+                {
+                    return throughput_weight;
+                }
+
+                float DSComputeLightTransmittanceWeight(float t_light)
+                {
+                    return exp(-Extinction * t_light);
+                }
+            #endif
+
+                #if MULTIPLE_SCATTERING && (SELECTED_INTEGRATOR == DISTANCE_SAMPLING || SELECTED_INTEGRATOR == RAY_MARCHING || SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING) 
+                vec3 MSMonteCarlo(mat4x3 world_to_box, vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound)
+                {
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+
+                    vec3 radiance = vec3(0.0);
+
+                #if USE_GOBO
+                    uint light_start_idx = GOBO_LIGHT_START_IDX;
+                    uint light_end_idx = light_start_idx + GOBO_LIGHT_COUNT;
+                #else
+                    uint light_start_idx = LIGHT_START_IDX;
+                    uint light_end_idx = light_start_idx + LIGHT_COUNT;
+                #endif
+
+                    // integration loop
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        vec3 cur_ray_org = ray_org;
+                        vec3 cur_ray_dir = ray_dir;
+
+                        float cur_ray_dir_upper_bound = ray_dir_upper_bound;
+
+                        // compute ray origin in box coordinates
+                        vec3 box_ray_org = vec3(world_to_box * vec4(cur_ray_org, 1.0));
+
+                        // compute ray direction in non-normalized box coordinates
+                        vec3 box_ray_dir = vec3(world_to_box * vec4(cur_ray_dir, 0.0));
+
+                        // compute exit point along camera ray
+                        vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                        vec3 box_dest = vec3(box_dest_t.xyz);
+
+                        vec3 throughput = vec3(1.0);
+                        for(uint depth_idx = 0u; depth_idx < RayDepth; depth_idx++)
+                        {
+                            // limit destination point by distance to surface
+                            float t_bound = min(box_dest_t.w, cur_ray_dir_upper_bound);
+
+                            float random_value = GENERATE_RANDOM_SAMPLE(seed);
+
+                        #if MULTIPLE_SCATTERING && USE_GOBO && SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING
+                            vec3 light_dir = vec3(0.0), box_light_dir = vec3(0.0);
+                            {
+                                vec3 light_contribution = vec3(0.0);
+
+                                for(uint light_idx = light_start_idx; light_idx < light_end_idx; light_idx++)
+                                {
+                                    vec3 light_dir = LightDir[light_idx];
+
+                                    // compute light ray direction in non-normalized box coordinates
+                                    vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                                    vec4 gobo_pos_radius = GoboPositionRadius[light_idx];
+                                    vec2 distance_to_gobo = DistanceToGobo(gobo_pos_radius, cur_ray_org, cur_ray_dir, light_dir);
+
+                                    float gobo_start = max(0.0, distance_to_gobo.x);
+                                    float gobo_end = clamp(distance_to_gobo.y - gobo_start, 0.0, box_dest_t.w);
+                                    float att = exp(- Extinction * gobo_start);
+
+                                    vec3 light_box_ray_org = box_ray_org + gobo_start * box_ray_dir; 
+
+                                    float gobo_ray_dir_upper_bound = clamp(cur_ray_dir_upper_bound - gobo_start, 0.0, gobo_end); 
+                                    vec4 mod_box_dest_t = box_dest_t;
+                                    mod_box_dest_t.w = max(0.0, mod_box_dest_t.w - gobo_start);
+
+                                    float light_contrib = att * BoxSliceIntegrateUnoccluded(world_to_box, light_box_ray_org,
+                                                                                            box_ray_dir, box_light_dir, gobo_ray_dir_upper_bound, mod_box_dest_t);
+                                    light_contribution[light_idx] = light_contrib;
+                                }
+
+                                float light_hist_1 = light_contribution[0] + light_contribution[1];
+                                float light_integral = light_hist_1 + light_contribution[2];
+
+                                if(light_integral > 0.0)
+                                {
+                                    float random_value = GENERATE_RANDOM_SAMPLE(seed);
+                                    float scaled_random_value = light_integral * random_value; 
+                                    uint light_idx = uint(scaled_random_value > light_contribution[0] || light_contribution[0] == 0.0) +
+                                                     uint(scaled_random_value > light_hist_1 || scaled_random_value == light_hist_1 && light_contribution[1] == 0.0 && light_contribution[0] == 0.0);
+
+                                    light_dir = LightDir[light_idx];
+
+                                    // compute light ray direction in non-normalized box coordinates
+                                    box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                                    vec4 gobo_pos_radius = GoboPositionRadius[light_idx];
+                                    vec2 distance_to_gobo = DistanceToGobo(gobo_pos_radius, cur_ray_org, cur_ray_dir, light_dir);
+
+                                    float gobo_start = max(0.0, distance_to_gobo.x);
+                                    float gobo_end = clamp(distance_to_gobo.y - gobo_start, 0.0, box_dest_t.w);
+                                    float att = exp(- Extinction * gobo_start);
+
+                                    vec3 light_box_ray_org = box_ray_org + gobo_start * box_ray_dir; 
+
+                                    float gobo_ray_dir_upper_bound = clamp(cur_ray_dir_upper_bound - gobo_start, 0.0, gobo_end); 
+
+                                    float gobo_t_dest = max(0.0, box_dest_t.w - gobo_start);
+
+                                    random_value = GENERATE_RANDOM_SAMPLE(seed);
+                                    vec4 light_dist_sampling_data = GenerateDistanceSample(random_value, gobo_ray_dir_upper_bound, gobo_t_dest, ray_dir, light_dir,
+                                                                                           world_to_box, light_box_ray_org, box_ray_dir, box_light_dir, box_dest);
+                                    float light_t = light_dist_sampling_data.x;
+
+                                    float light_weight = light_integral / light_contribution[light_idx];
+
+                                    // weight only by transmittance along light path segment
+                                    vec3 throughput_weight = ComputeThroughputWeight(light_dist_sampling_data);
+
+                                    vec3 light_color = LightColor[light_idx] * LightIntensityMultiplier;
+
+
+                                    // compute point along camera ray in world coordinates
+                                    vec3 light_ray_point = cur_ray_org + (gobo_start + light_t) * cur_ray_dir;
+
+                                    // intersect scene geometry and determine visibility
+                                    float visibility = float(SampleGeometry(light_ray_point, light_dir) == MAX_DISTANCE);
+
+                                    float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(cur_ray_dir, light_dir));
+                                    float light_transmittance_weight = ComputeLightTransmittanceWeight(0.0 /* t_light */); // Modify this if it ever matters 
+                                    radiance += att * visibility * light_transmittance_weight * light_weight * throughput_weight * throughput * hg_phase * light_color;
+                                }
+                            }
+                        #else
+                            vec3 light_dir = LightDir[0];
+                            vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+                        #endif
+
+                            vec4 dist_sampling_data = GenerateMSDistanceSample(random_value, t_bound, box_dest_t.w, ray_dir, light_dir,
+                                                                               world_to_box, box_ray_org, box_ray_dir, box_light_dir, box_dest);
+                            float t = clamp(dist_sampling_data.x, 0.0, t_bound);
+
+                            // weight only by transmittance along light path segment
+                            vec3 throughput_weight = ComputeThroughputWeight(dist_sampling_data);
+
+                            // compute point along camera ray in world coordinates
+                            vec3 ray_point = cur_ray_org + t * cur_ray_dir;
+
+                            // compute point along camera ray in box coordinates
+                            vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+    
+                        #if !(MULTIPLE_SCATTERING && USE_GOBO && SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING)
+                            // Independently collect all contributions from light sources
+                            for(uint light_idx = light_start_idx; light_idx < light_end_idx; light_idx++)
+                            {
+                                vec3 cur_light_dir = LightDir[light_idx];
+
+                                // compute light ray direction in non-normalized box coordinates
+                                vec3 cur_box_light_dir = vec3(world_to_box * vec4(cur_light_dir, 0.0));
+
+                                // intersect scene geometry and determine visibility
+                                float visibility = float(SampleGeometry(ray_point, cur_light_dir) == MAX_DISTANCE);
+
+                            #if USE_GOBO && MULTIPLE_SCATTERING
+                                vec4 gobo_pos_radius = GoboPositionRadius[light_idx];
+                                if(!IsInsideGobo(gobo_pos_radius, ray_point, cur_light_dir))
+                                    visibility = 0.0;
+                            #endif
+
+                                vec3 light_color = LightColor[light_idx] * LightIntensityMultiplier;
+
+                                vec2 box_t = SlabTestUnbound(ray_light_start, cur_box_light_dir);
+                                float t_light = box_t.y;
+
+                                float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(cur_ray_dir, cur_light_dir));
+                                float light_transmittance_weight = ComputeLightTransmittanceWeight(t_light); 
+                                radiance += visibility * light_transmittance_weight * throughput_weight * throughput * hg_phase * light_color;
+                                
+                                if(isnan(t_light))
+                                    return vec3(0.0);
+                            }
+                        #endif
+
+                            vec2 r = vec2(GENERATE_RANDOM_SAMPLE(seed), GENERATE_RANDOM_SAMPLE(seed));
+                            cur_ray_dir = SampleHenyeyGreenstein(cur_ray_dir, HenyeyGreensteinG, r);
+                            cur_ray_org = ray_point;
+
+                            cur_ray_dir_upper_bound = SampleGeometry(cur_ray_org, cur_ray_dir);
+                            throughput *= ComputeMSThroughputWeight(throughput_weight, dist_sampling_data);
+
+                            // Transform ray direction to box coordinates
+                            box_ray_dir = vec3(world_to_box * vec4(cur_ray_dir, 0.0));
+                            box_ray_org = ray_light_start;
+
+                            // Compute exit point along camera ray
+                            box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                            box_dest = vec3(box_dest_t.xyz);
+
+                            if(cur_ray_dir_upper_bound == MAX_DISTANCE)
+                                radiance += throughput * SkyColor * exp(- Extinction * box_dest_t.w);
+                        }
+                    }
+
+                    radiance /= float(SampleCount);
+
+                    return radiance;
+                }
+                #endif
+
+                // Ratio estimator with distance sampling strategy
+                #if MULTIPLE_SCATTERING && (SELECTED_INTEGRATOR == RATIO_ESTIMATOR || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING)
+                vec3 MSRatioEstimator(mat4x3 world_to_box, vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound,
+                                      out vec3 ms_unoccluded_estimate, out vec3 ratio_unoccluded_estimate)
+                {
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+
+                    vec3 radiance = vec3(0.0);
+
+                    ms_unoccluded_estimate = vec3(0.0);
+                    ratio_unoccluded_estimate = vec3(0.0);
+
+                #if USE_GOBO
+                    uint light_start_idx = GOBO_LIGHT_START_IDX;
+                    uint light_end_idx = light_start_idx + GOBO_LIGHT_COUNT;
+                #else
+                    uint light_start_idx = LIGHT_START_IDX;
+                    uint light_end_idx = light_start_idx + LIGHT_COUNT;
+                #endif
+
+                    // integration loop
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        vec3 cur_ray_org = ray_org;
+                        vec3 cur_ray_dir = ray_dir;
+
+                        float cur_ray_dir_upper_bound = ray_dir_upper_bound;
+
+                        // compute ray origin in box coordinates
+                        vec3 box_ray_org = vec3(world_to_box * vec4(cur_ray_org, 1.0));
+
+                        // compute ray direction in non-normalized box coordinates
+                        vec3 box_ray_dir = vec3(world_to_box * vec4(cur_ray_dir, 0.0));
+
+                        // compute exit point along camera ray
+                        vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                        vec3 box_dest = vec3(box_dest_t.xyz);
+
+                        vec3 throughput = vec3(1.0);
+                        for(uint depth_idx = 0u; depth_idx < RayDepth; depth_idx++)
+                        {
+                            // limit destination point by distance to surface
+                            float t_bound = min(box_dest_t.w, cur_ray_dir_upper_bound);
+
+                            float random_value = GENERATE_RANDOM_SAMPLE(seed);
+                            
+                            // start simple
+                            vec3 light_dir = LightDir[0];
+                            vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                            vec4 dist_sampling_data = GenerateDistanceSample(random_value, t_bound, box_dest_t.w, ray_dir, light_dir,
+                                                                             world_to_box, box_ray_org, box_ray_dir, box_light_dir, box_dest);
+                            float t = dist_sampling_data.x;
+                            // compute point along camera ray in world coordinates
+                            vec3 ray_point = cur_ray_org + t * cur_ray_dir;
+
+                            // compute point along camera ray in box coordinates
+                            vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+
+                            // weight only by transmittance along light path segment
+                            vec3 throughput_weight = ComputeThroughputWeight(dist_sampling_data); 
+
+                            for(uint light_idx = light_start_idx; light_idx < light_end_idx; light_idx++)
+                            {
+                                light_dir = LightDir[light_idx];
+
+                                // compute light ray direction in non-normalized box coordinates
+                                box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                                // compute unoccluded radiance
+
+                            #if USE_GOBO
+                                vec4 gobo_pos_radius = GoboPositionRadius[light_idx];
+                                vec2 distance_to_gobo = DistanceToGobo(gobo_pos_radius, cur_ray_org, cur_ray_dir, light_dir);
+
+                                float gobo_start = max(0.0, distance_to_gobo.x);
+                                float gobo_end = clamp(distance_to_gobo.y - gobo_start, 0.0, box_dest_t.w);
+                                float att = exp(- Extinction * gobo_start);
+
+                                vec3 light_box_ray_org = box_ray_org + gobo_start * box_ray_dir; 
+
+                                float gobo_ray_dir_upper_bound = clamp(cur_ray_dir_upper_bound - gobo_start, 0.0, gobo_end); 
+                                vec4 mod_box_dest_t = box_dest_t;
+                                mod_box_dest_t.w = max(0.0, mod_box_dest_t.w - gobo_start);
+
+                                float unoccluded_integral = att * BoxSliceIntegrateUnoccluded(world_to_box, light_box_ray_org,
+                                                                                               box_ray_dir, box_light_dir, gobo_ray_dir_upper_bound, mod_box_dest_t);
+                            #else
+                                float unoccluded_integral = BoxSliceIntegrateUnoccluded(world_to_box, box_ray_org,
+                                                                                        box_ray_dir, box_light_dir, cur_ray_dir_upper_bound, box_dest_t);
+                            #endif
+                                float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(cur_ray_dir, light_dir));
+                                vec3 light_color = LightColor[light_idx] * LightIntensityMultiplier;
+                                vec3 phase_light_contrib = throughput * hg_phase * light_color;
+                                ms_unoccluded_estimate += unoccluded_integral * phase_light_contrib * ScatteringCoef;
+
+                            #if USE_GOBO && MULTIPLE_SCATTERING
+                                if(IsInsideGobo(gobo_pos_radius, ray_point, light_dir))
+                                {
+                            #endif
+                                    // intersect scene geometry and determine visibility
+                                    float visibility = float(SampleGeometry(ray_point, light_dir) == MAX_DISTANCE);
+
+                                    vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                                    float cur_t_light = box_t.y;
+
+                                    float transmittance_weight = ComputeLightTransmittanceWeight(cur_t_light);
+                                    vec3 unoccluded_contrib = transmittance_weight * throughput_weight * phase_light_contrib;
+                                    radiance += visibility * unoccluded_contrib;
+                                    
+                                    ratio_unoccluded_estimate += unoccluded_contrib;
+                            #if USE_GOBO && MULTIPLE_SCATTERING
+                                }
+                            #endif
+                            }
+
+                            vec2 r = vec2(GENERATE_RANDOM_SAMPLE(seed), GENERATE_RANDOM_SAMPLE(seed));
+                            cur_ray_dir = SampleHenyeyGreenstein(cur_ray_dir, HenyeyGreensteinG, r);
+                            cur_ray_org = ray_point;
+
+                            cur_ray_dir_upper_bound = SampleGeometry(cur_ray_org, cur_ray_dir);
+                            throughput *= ComputeMSThroughputWeight(throughput_weight, dist_sampling_data);
+
+                            // Transform ray direction to box coordinates
+                            box_ray_dir = vec3(world_to_box * vec4(cur_ray_dir, 0.0));
+                            box_ray_org = ray_light_start;
+
+                            // Compute exit point along camera ray
+                            box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                            box_dest = vec3(box_dest_t.xyz);
+
+                            if(cur_ray_dir_upper_bound == MAX_DISTANCE)
+                            {
+                                vec3 sky_contrib = throughput * SkyColor * exp(- Extinction * box_dest_t.w); 
+                                radiance += sky_contrib;
+                                ms_unoccluded_estimate += sky_contrib;
+                                ratio_unoccluded_estimate += sky_contrib;
+                            }
+                        }
+                    }
+
+                #if ACCUMULATE_MODE == 0
+                    radiance *= ms_unoccluded_estimate / (float(SampleCount) * (ratio_unoccluded_estimate + vec3(1e-32)));
+                #else
+                    radiance /= float(SampleCount);
+                #endif
+                
+                    return radiance;
+                }
+                #endif
+
+
+                #if SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING
+                vec3 RatioEstimatorDistanceSampling(mat4x3 world_to_box,
+                                                    vec3 ray_org, vec3 ray_dir, float ray_dir_upper_bound, vec3 light_dir, vec3 light_color,
+                                                    out vec3 ms_unoccluded_estimate,
+                                                    out vec3 ratio_unoccluded_estimate)
+                {
+                    // compute ray origin in box coordinates
+                    vec3 box_ray_org = vec3(world_to_box * vec4(ray_org, 1.0));
+
+                    // compute ray direction in non-normalized box coordinates
+                    vec3 box_ray_dir = vec3(world_to_box * vec4(ray_dir, 0.0));
+
+                    // compute light ray direction in non-normalized box coordinates
+                    vec3 box_light_dir = vec3(world_to_box * vec4(light_dir, 0.0));
+
+                    // compute exit point along camera ray
+                    vec4 box_dest_t = IntersectFaceInBoxSpace(box_ray_org, box_ray_dir);
+                    vec3 box_dest = vec3(box_dest_t.xyz);
+                    float t_dest = box_dest_t.w;
+
+                    // compute unoccluded radiance
+                    float unoccluded_integral = BoxSliceIntegrateUnoccluded(world_to_box, box_ray_org, box_ray_dir,
+                        box_light_dir, ray_dir_upper_bound, box_dest_t);
+
+                    // limit destination point by distance to surface
+                    float t_bound = min(t_dest, ray_dir_upper_bound);
+
+                    // precompute some values used by distance sampling                    
+                    float exp_upper = 1.0 - exp(-Extinction * t_bound);
+                    float denom = -1.0 / Extinction;
+
+                    float integral = 0.0;
+
+                    float rcp_SampleCount = 1.0 / float(SampleCount);
+
+                    float est_unoccluded = 0.0;
+
+                    SEED_TYPE seed = GENERATE_INIT_SEED(gl_FragCoord.xy, FrameIndex);
+                    
+                    for(uint idx = 0u; idx < SampleCount; idx++)
+                    {
+                        // generate random values
+                        float n = GENERATE_RANDOM_SAMPLE(seed);
+                        float random_value = (float(idx) + n) * rcp_SampleCount;
+                        
+                        // spread following distance sampling strategy
+                        float t = denom * log(1.0 - exp_upper * random_value);
+
+                        // compute point along camera ray in world coordinates
+                        vec3 ray_point = ray_org + t * ray_dir;
+
+                        // intersect scene geometry and determine visibility
+                        float visibility = float(SampleGeometry(ray_point, light_dir) == MAX_DISTANCE);
+
+                        // compute point along camera ray in box coordinates
+                        vec3 ray_light_start = box_ray_org + t * box_ray_dir;
+
+                        // intersect box to determine distance to exit point along light ray
+                        vec2 box_t = SlabTestUnbound(ray_light_start, box_light_dir);
+                        float t_light = box_t.y;
+
+                        // transmittance along light path segment
+                        float weight = exp(-Extinction * t_light);
+
+                        // accumulate in unoccluded term
+                        est_unoccluded += weight;
+
+                        // weight by visibility in occluded term
+                        integral += visibility * weight;
+                    }
+
+                    float hg_phase = HenyeyGreensteinPhase(HenyeyGreensteinG, -dot(ray_dir, light_dir));
+                    vec3 radiance = integral * hg_phase * ScatteringCoef;
+
+                #if ACCUMULATE_MODE == 0
+                    // apply ratio term and avoid fully occluded cases
+                    if(est_unoccluded > 0.0)
+                        radiance *= unoccluded_integral / est_unoccluded;
+                    else
+                        radiance = vec3(0.0);
+                #else
+                    ms_unoccluded_estimate = vec3(unoccluded_integral);
+                    ratio_unoccluded_estimate = vec3(est_unoccluded);
+                    #if MULTIPLE_LIGHTS
+                        ms_unoccluded_estimate *= light_color * hg_phase * ScatteringCoef;
+                        ratio_unoccluded_estimate *= exp_upper / Extinction * light_color * rcp_SampleCount * hg_phase * ScatteringCoef;
+                        radiance *= exp_upper / Extinction * rcp_SampleCount;
+                    #endif
+                #endif
+
+                    return radiance * light_color;
+                }
+                #endif
+
+                void mainImage(out vec4 fragColor, in vec2 fragCoord)
+                {
+                    // compute screen coordinates
+                    vec2 screen_pos = fragCoord/iResolution.xy * 2.0 - vec2(1.0);
+                    vec2 uv = fragCoord/iResolution.xy;
+
+                    float aspect = iResolution.x / iResolution.y;
+
+                    // fovy factor
+                    float fy = 1.0 / tan(radians(FOV_Y)*0.5);
+
+                    // perspective projection matrix
+                    mat4 proj_mat = mat4(vec4(fy / aspect, 0.0, 0.0,   0.0),
+                                         vec4(0.0,         fy, 0.0,   0.0), 
+                                         vec4(0.0,        0.0, -1.0, -1.0),
+                                         vec4(0.0,        0.0, -2.0*NearPlane,  0.0));
+
+                    mat4 inv_proj_mat = inverse(proj_mat);
+
+                #if USE_GOBO
+                    // box size
+                    vec3 box_size = GoboBoxSize;
+
+                    // compute box rotation
+                    float box_angle = radians(GoboBoxRotUp);
+                #else
+                    // box size
+                    vec3 box_size = BoxSize;
+
+                    // compute box rotation
+                    float box_angle = radians(BoxRotUp);
+                #endif
+                    float cos_ba = cos(box_angle);
+                    float sin_ba = sin(box_angle);
+                    vec3 tangent = vec3(cos_ba, 0, sin_ba);
+                    vec3 binormal = vec3(0, 1, 0);
+                    vec3 normal = vec3(-sin_ba, 0, cos_ba);
+
+                    vec3 inv_box_size = 1.0 / box_size;
+
+                    // transformation from box to world coordinates
+                    mat4x3 box_to_world = mat4x3(box_size.x * tangent,
+                                                 box_size.y * binormal,
+                                                 box_size.z * normal,
+                                                 BoxPosition);
+                    
+                    // the same but inverted
+                    mat4x3 world_to_box = mat4x3(vec3(inv_box_size.x * tangent.x, inv_box_size.y * binormal.x, inv_box_size.z * normal.x),
+                                                 vec3(inv_box_size.x * tangent.y, inv_box_size.y * binormal.y, inv_box_size.z * normal.y),
+                                                 vec3(inv_box_size.x * tangent.z, inv_box_size.y * binormal.z, inv_box_size.z * normal.z),
+                                                 -vec3(inv_box_size.x * dot(BoxPosition, tangent),
+                                                       inv_box_size.y * dot(BoxPosition, binormal),
+                                                       inv_box_size.z * dot(BoxPosition, normal)));
+
+                    // compute world position
+                    vec4 world_pos = inv_proj_mat * vec4(screen_pos, 1, 1);
+                    vec3 view = normalize(world_pos.xyz - CameraPosition * world_pos.w);
+
+                    // intersect the box
+                    vec2 box_t = SlabTestUnbound(world_to_box, CameraPosition, view);
+
+                    // intersect scene geometry
+                    float distance = SampleGeometry(CameraPosition, view);
+                    
+                    // clamp distances to lie within visible distance
+                    float t_start_init = max(0.0, box_t.x);
+                    float t_bound = max(0.0, min(box_t.y - t_start_init, distance - t_start_init));
+
+                    // compute transmittance when light passes without scattering through the medium
+                    float transmittance = exp(-Extinction * t_bound);
+
+                    // apply sky color on unoccluded pixels
+                    fragColor.w = 1.0;
+                    if(distance == MAX_DISTANCE)
+                        fragColor.xyz = SkyColor * transmittance;
+                    else
+                        fragColor.xyz = vec3(0);
+
+                    // don't consider pixels where the box is not intersected
+                    if(box_t.y <= 0.0 || box_t.y <= box_t.x)
+                    {
+                        t_start_init = 0.0;
+                        t_bound = 0.0;
+                        distance = 0.0;
+                    }
+                    
+                    // choose lighting depending on scene
+                #if USE_GOBO
+                    uint light_start_idx = GOBO_LIGHT_START_IDX;
+                    uint light_end_idx = light_start_idx + GOBO_LIGHT_COUNT;
+                #else
+                    uint light_start_idx = LIGHT_START_IDX;
+                    uint light_end_idx = light_start_idx + LIGHT_COUNT;
+                #endif
+
+                    vec3 ms_unoccluded_estimate = vec3(0.0);
+                    vec3 ratio_unoccluded_estimate = vec3(0.0);
+
+                    vec3 ms_radiance = vec3(0.0);
+
+                    // perform integration
+                    #if MULTIPLE_SCATTERING
+                        float ray_cut_off = distance - t_start_init;
+                        ray_cut_off = clamp(ray_cut_off, 0.0, t_bound);
+                        vec3 pos_start = CameraPosition + view * t_start_init;
+
+                        #if SELECTED_INTEGRATOR == DISTANCE_SAMPLING || SELECTED_INTEGRATOR == RAY_MARCHING || SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING  
+                            ms_radiance = ray_cut_off > 0.0 ? MSMonteCarlo(world_to_box, pos_start, view, ray_cut_off) : vec3(0.0);
+                        #elif SELECTED_INTEGRATOR == RATIO_ESTIMATOR || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING
+                            ms_radiance = ray_cut_off > 0.0 ? MSRatioEstimator(world_to_box, pos_start, view, ray_cut_off,
+                                                                               ms_unoccluded_estimate, ratio_unoccluded_estimate) : vec3(0.0);
+                        #endif
+                    #else
+                        // compute contribution for all light sources
+                        for(uint light_idx = light_start_idx; light_idx < light_end_idx; light_idx++)
+                        {
+                            float t_start = t_start_init;
+                            vec3 light_dir = LightDir[light_idx];
+
+                            vec4 gobo_pos_radius = GoboPositionRadius[light_idx];
+
+                            float ray_cut_off = distance - t_start;
+                            float ext_start;
+                            // compute distances to gobo
+                        #if USE_GOBO && !MULTIPLE_SCATTERING
+                            vec2 distance_to_gobo = DistanceToGobo(gobo_pos_radius, CameraPosition, view, light_dir);
+                            t_start = clamp(t_start_init, distance_to_gobo.x, distance_to_gobo.y);
+                            float gobo_end = max(0.0, distance_to_gobo.y - t_start);
+                            ext_start = max(0.0, distance_to_gobo.x - t_start_init);
+                            ray_cut_off = min(distance - t_start, gobo_end);
+                        #endif
+                            
+                            ray_cut_off = clamp(ray_cut_off, 0.0, t_bound);
+                            
+                            vec3 pos_start = CameraPosition + view * t_start;
+
+                            vec3 integral = vec3(0.0);
+                            vec3 light_color = LightColor[light_idx] * LightIntensityMultiplier;
+
+                            #if SELECTED_INTEGRATOR == RATIO_ESTIMATOR || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING
+                                vec3 cur_ms_unoccluded_estimate;
+                                vec3 cur_ratio_unoccluded_estimate;
+                            #endif
+
+                            #if SELECTED_INTEGRATOR == WHOLE_VOLUME_DISTANCE_SAMPLING 
+                                integral = MonteCarloWholeVolumeSampling(world_to_box, pos_start, view, ray_cut_off, light_dir, light_color);
+                            #elif SELECTED_INTEGRATOR == RAY_MARCHING
+                                integral = RayMarchingIntegrator(world_to_box, pos_start, view, ray_cut_off, light_dir, light_color);
+                            #elif SELECTED_INTEGRATOR == RATIO_ESTIMATOR
+                                integral = RatioEstimatorRayMarchingIntegrator(world_to_box, pos_start, view, ray_cut_off, light_dir, light_color,
+                                                                               cur_ms_unoccluded_estimate, cur_ratio_unoccluded_estimate);
+                            #elif SELECTED_INTEGRATOR == DISTANCE_SAMPLING
+                                integral = MonteCarloDistanceSampling(world_to_box, pos_start, view, ray_cut_off, light_dir, light_color);
+                            #elif SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING
+                                integral = RatioEstimatorDistanceSampling(world_to_box, pos_start, view, ray_cut_off, light_dir, light_color,
+                                                                          cur_ms_unoccluded_estimate, cur_ratio_unoccluded_estimate);
+                            #endif
+
+                        // apply attenuation until reaching gobo
+                        #if USE_GOBO
+                            float gobo_exp = exp(-Extinction * ext_start); 
+                            integral *= gobo_exp;
+
+                            #if SELECTED_INTEGRATOR == RATIO_ESTIMATOR || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING
+                                cur_ms_unoccluded_estimate *= gobo_exp;
+                                cur_ratio_unoccluded_estimate *= gobo_exp;
+                            #endif
+                        #endif
+    
+                            if(ray_cut_off <= 0.0)
+                            {
+                                integral = vec3(0.0);
+                            }
+    
+                        #if SELECTED_INTEGRATOR == RATIO_ESTIMATOR || SELECTED_INTEGRATOR == RATIO_ESTIMATOR_DISTANCE_SAMPLING
+                            if(ray_cut_off > 0.0)
+                            {
+                                ms_unoccluded_estimate += cur_ms_unoccluded_estimate;
+                                ratio_unoccluded_estimate += cur_ratio_unoccluded_estimate;
+                            }
+                        #endif
+
+                            // accumulate radiance
+                            ms_radiance += integral;
+                        }        
+                    #endif
+
+                    // output and convert to sRGB
+                    #if ACCUMULATE_MODE == 0
+                        fragColor.xyz += ms_radiance;
+                        fragColor.xyz = RGBToSRGB(fragColor.xyz);
+                    #elif ACCUMULATE_MODE == 1
+                        fragColor.xyz += ms_radiance;
+                        fragColor.xyz = texelFetch(PrevFrame, ivec2(gl_FragCoord), 0).xyz * MultiFrameMixFactor.x +  fragColor.xyz * MultiFrameMixFactor.y;
+                    #else
+                        vec4 prev_surface0 = texelFetch(PrevFrame, ivec2(gl_FragCoord), 0);
+                        vec4 prev_surface1 = texelFetch(PrevFrame2, ivec2(gl_FragCoord), 0);
+                        vec4 prev_surface2 = texelFetch(PrevFrame3, ivec2(gl_FragCoord), 0);
+
+                        vec3 prev_ms_radiance = vec3(prev_surface0.w, prev_surface1.w, prev_surface2.w);
+                        vec3 prev_ms_unoccluded = prev_surface1.xyz;
+                        vec3 prev_ratio_unoccluded = prev_surface2.xyz;
+
+                        ms_radiance = prev_ms_radiance * MultiFrameMixFactor.x + ms_radiance * MultiFrameMixFactor.y;
+                        if(MultiFrameMixFactor.x != 0.0)
+                        {
+                            ms_unoccluded_estimate += prev_ms_unoccluded;
+                            ratio_unoccluded_estimate += prev_ratio_unoccluded;
+                        }
+
+                        fragColor.xyz += ms_radiance * ms_unoccluded_estimate / (ratio_unoccluded_estimate + vec3(1e-32));
+                        fragColor.w = ms_radiance.x;
+                        AdditionalSurface = vec4(ms_unoccluded_estimate, ms_radiance.y);
+                        AdditionalSurface2 = vec4(ratio_unoccluded_estimate, ms_radiance.z);
+                    #endif
+                }
+            `;
+            
+            var vertex_shader = `#version 300 es
+
+                precision highp float;
+
+                void main(void)
+                {
+                    // generate full screen triangle
+                    vec2 TexCoord = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+                    gl_Position = vec4(TexCoord * vec2(2) - vec2(1), 0, 1);
+                }
+            `;
+
+            var medium_fragment_shader = `precision highp float;
+
+                uniform vec2 iResolution;
+
+                layout(location=0) out vec4 Color;` +
+                
+                shader_toy + `
+
+                void main(void)
+                {
+                    mainImage(Color, gl_FragCoord.xy);
+                }
+            `;
+
+            var blit_fragment_shader = `#version 300 es
+
+                precision highp float;
+
+                uniform vec2 iResolution;
+
+                uniform sampler2D InputTexture;
+
+                float RGBToSRGBComponent(float val)
+                {
+                    if (val <= 0.0031308)
+                        return val * 12.92;
+                    else
+                        return 1.055 * pow(val, 1.0 / 2.4) - 0.055;
+                }
+
+                // Convert from RGB to sRGB color space
+                vec3 RGBToSRGB(vec3 color)
+                {
+                    return vec3(RGBToSRGBComponent(color.x), RGBToSRGBComponent(color.y), RGBToSRGBComponent(color.z));
+                }
+
+                out vec4 Color;
+
+                void main(void)
+                {
+                    vec3 fragColor = texelFetch(InputTexture, ivec2(gl_FragCoord.xy), 0).xyz;
+                    Color = vec4(RGBToSRGB(fragColor.xyz), 1.0);
+                }
+            `;
+
+            // get canvas and div element to setup rendering
+            var canvas = document.getElementById("draw_surface");
+            var draw_surface_box = document.getElementById("draw_surface_box");
+            var ui_elements_surface = document.getElementById("ui_elements_surface");
+
+            var gl = canvas.getContext('webgl2');
+
+            var ctx_2d = ui_elements_surface.getContext('2d');
+
+            if(gl)
+            {
+                function parseBoolean(str)
+                {
+                    return (str === 'true');
+                }
+
+                var rendering_element = document.querySelector('#rendering');
+
+                // setup parameters for rendering
+                integrator = 0;
+                scene = 0;
+                var camera_x = 0.0;
+                var camera_y = 0.0;
+                var camera_z = 0.0;
+                var wheel_speed = 0.1;
+                var light_intensity_multiplier = 1.0;
+
+                function SRGBToRGBComponent(lum)
+                {
+                    if(lum <= 0.04045)
+                        return lum / 12.92;
+                    else
+                        return Math.pow((lum + 0.055) / 1.055, 2.4);
+                }
+
+                function parseRGB(value)
+                {
+                    var arr = value.match(/[A-Za-z0-9]{2}/g);
+                    return arr.map(v => { return SRGBToRGBComponent(parseInt(v, 16)/255.0); });
+                };
+
+                var sample_count_form = document.getElementById("sample_count");
+                var ray_depth_form = document.getElementById("ray_depth");
+                var hg_g_form = document.getElementById("hg_g");
+                var albedo_form = document.getElementById("albedo");
+                var sky_color_form = document.getElementById("sky_color");
+
+                var program = null;
+                var front_fbo = null;
+                var back_fbo = null;
+                var backbuffer_swap_chain = null;
+                var iResolution = null;
+                var IntegratorParameters = null;
+                var CameraParameters = null;
+                var VolumeParameters = null;
+                var VolumeParameters2 = null;
+                var SkyColor = null;
+
+                const SHADER_CACHE_DEFAULT_STATE = 0b00000000; 
+                const SHADER_CACHE_MULTI_SCATTERING_BIT = 0b00000001;
+                const SHADER_CACHE_ACCUMULATE_BIT = 0b00010000;
+                const SHADER_CACHE_RATIO_ESTIMATOR_BIT = 0b00100000;
+                const SHADER_CACHE_GOBO_BIT = 0b01000000;
+                const SHADER_CACHE_INTEGRATOR_MASK = 0b00001110;
+                const SHADER_CACHE_INTEGRATOR_SHIFT = 1;
+
+                const url_params = new URLSearchParams(window.location.search);
+                const light_intensity_multiplier_param = url_params.get("light_intensity_multiplier");
+                if(light_intensity_multiplier_param)
+                {
+                    light_intensity_multiplier = parseFloat(light_intensity_multiplier_param);
+                }
+
+                const GoboExtinction = 0.2;
+                const Extinction = 1.0;
+
+                const GoboSkyColorValue = "#10101f";
+                const SkyColorValue = "#000000";
+
+                function SetupBoxScene()
+                {
+                    extinction.value = Extinction;
+                    sky_color_form.value = SkyColorValue;
+                }
+
+                function SetupGoboScene()
+                {
+                    extinction.value = GoboExtinction;
+                    sky_color_form.value = GoboSkyColorValue;
+                }
+
+                let shader_cache = new Map();
+
+                var available_extensions = gl.getSupportedExtensions();
+                const color_buffer_float = available_extensions.indexOf("EXT_color_buffer_float") != -1;
+
+                if(color_buffer_float)
+                {
+                    console.log("loading float color buffers extension");
+                    ext = (gl.getExtension("EXT_color_buffer_float"),
+                           gl.getExtension("OES_texture_float"));
+                }
+                else
+                {
+                    console.warn("float color buffers extension is not available. Multi-frame accumulation won't be performed at high sample count, possibly affecting stability!");
+                }
+
+                // compile shader
+                function createShader(source, type)
+                {
+                    var shader = gl.createShader(type);
+                    gl.shaderSource(shader, source);
+                    gl.compileShader(shader);
+                    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS))
+                        throw new Error(gl.getShaderInfoLog(shader));
+                    return shader;
+                }
+
+                function getShaderFromCache(gl)
+                {
+                    shader_cache_vars = SHADER_CACHE_DEFAULT_STATE;
+                    ray_depth = ray_depth_form.value;
+                    if(ray_depth > 1)
+                    {
+                        shader_cache_vars |= SHADER_CACHE_MULTI_SCATTERING_BIT;
+                    }
+
+                    const frame_info = getComputationFrameCount();
+                    if(frame_info.frame_count > 1 && color_buffer_float)
+                    {
+                        shader_cache_vars |= SHADER_CACHE_ACCUMULATE_BIT;
+                        console.log("Accumulate enabled");
+                    }
+                    integrator_bits = integrator << SHADER_CACHE_INTEGRATOR_SHIFT;
+                    shader_cache_vars |= integrator_bits;
+                    console.assert((integrator_bits & ~SHADER_CACHE_INTEGRATOR_MASK) == 0, "integrator bits overflow");
+
+                    var ratio_est = isRatioEstimator(integrator);
+                    if(ratio_est)
+                    {
+                        shader_cache_vars |= SHADER_CACHE_RATIO_ESTIMATOR_BIT;
+                        console.log("Ratio estimator enabled");
+                    }
+
+                    if(scene == 1)
+                    {
+                        shader_cache_vars |= SHADER_CACHE_GOBO_BIT;
+                        console.log("Gobo enabled");
+                    }
+
+                    program = shader_cache.get(shader_cache_vars);
+                    if(program == null)
+                    {
+                        program = { code: gl.createProgram() };
+                        gl.attachShader(program.code, createShader(vertex_shader, gl.VERTEX_SHADER));
+
+                        shader_defines = "#version 300 es\n";
+
+                        shader_defines += "#define MULTIPLE_SCATTERING " + ((shader_cache_vars & SHADER_CACHE_MULTI_SCATTERING_BIT) ? "1\n" : "0\n");
+                        shader_defines += "#define ACCUMULATE_MODE ";
+                        if(shader_cache_vars & SHADER_CACHE_ACCUMULATE_BIT)
+                        {
+                            shader_defines += ((shader_cache_vars & SHADER_CACHE_RATIO_ESTIMATOR_BIT) ? "2\n" : "1\n"); 
+                        }
+                        else
+                        {
+                            shader_defines += "0\n";
+                        }
+
+                        shader_defines += "#define USE_GOBO " + ((shader_cache_vars & SHADER_CACHE_GOBO_BIT) ? "1\n" : "0\n");
+                        
+                        selected_integrator = (shader_cache_vars & SHADER_CACHE_INTEGRATOR_MASK) >> SHADER_CACHE_INTEGRATOR_SHIFT;
+                        shader_defines += "#define SELECTED_INTEGRATOR " + selected_integrator.toString() + "\n"; 
+
+                        var fragment_shader_with_defines = shader_defines + medium_fragment_shader; 
+
+                        gl.attachShader(program.code, createShader(fragment_shader_with_defines, gl.FRAGMENT_SHADER));
+                        gl.linkProgram(program.code);
+
+                        gl.useProgram(program.code);
+
+                        program.iResolution = gl.getUniformLocation(program.code, 'iResolution');
+                        program.IntegratorParameters = gl.getUniformLocation(program.code, "IntegratorParameters");
+                        program.CameraParameters = gl.getUniformLocation(program.code, "CameraParameters");
+                        program.VolumeParameters = gl.getUniformLocation(program.code, "VolumeParameters");
+                        program.VolumeParameters2 = gl.getUniformLocation(program.code, "VolumeParameters2");
+                        program.SkyColor = gl.getUniformLocation(program.code, "SkyColorParameter");
+                        program.MultiFrameMixFactor = gl.getUniformLocation(program.code, "MultiFrameMixFactor");
+                        program.PrevFrame = gl.getUniformLocation(program.code, "PrevFrame");
+                        program.PrevFrame2 = gl.getUniformLocation(program.code, "PrevFrame2");
+                        program.PrevFrame3 = gl.getUniformLocation(program.code, "PrevFrame3");
+
+                        shader_cache.set(shader_cache_vars, program);
+                    }
+
+                    return program;
+                }
+
+                function createBlitShaderProgram()
+                {
+                    program = { code: gl.createProgram() };
+                    gl.attachShader(program.code, createShader(vertex_shader, gl.VERTEX_SHADER));
+                    gl.attachShader(program.code, createShader(blit_fragment_shader, gl.FRAGMENT_SHADER));
+                    gl.linkProgram(program.code);
+
+                    gl.useProgram(program.code);
+
+                    program.InputTexture = gl.getUniformLocation(program.code, "InputTexture");
+                    return program;
+                }
+
+                var blit_program = createBlitShaderProgram();
+
+                var extinction = document.getElementById("extinction");
+                // handle change of parameters
+                extinction.onchange = redraw;
+                hg_g_form.onchange = redraw;
+
+                const scene_param = url_params.get("scene");
+                if(scene_param)
+                {
+                    const scenes = document.querySelectorAll('input[name="scene"]');
+                    for (const rb_scene of scenes)
+                    {
+                        if(rb_scene.value == scene_param)
+                        {
+                            switch(rb_scene.value)
+                            {
+                            case "box_scene": scene = 0; SetupBoxScene(); break;
+                            case "gobo_scene": scene = 1; SetupGoboScene(); break;
+                            }
+                            rb_scene.checked = true;
+                        }
+                    }
+                }
+
+                function reloadShaderAndRedraw()
+                {
+                    program = getShaderFromCache(gl);
+                    redraw();
+                }
+
+                sample_count_form.onchange = reloadShaderAndRedraw;
+                ray_depth_form.onchange = reloadShaderAndRedraw;
+                albedo_form.onchange = redraw;
+                sky_color_form.onchange = redraw;
+
+                var bounce_limit_param = url_params.get("bounce_limit");
+                if(!bounce_limit_param)
+                {
+                    bounce_limit_param = 32;
+                }
+
+                function getComputationFrameCount()
+                {
+                    const ray_depth = ray_depth_form.value;
+                    const bounce_limit = Math.max(bounce_limit_param, ray_depth);
+                    const selected_samples = sample_count_form.value;
+                    const light_source_mul = scene == 1 ? 3 : 1; 
+                    const samples = Math.max(1, Math.min(selected_samples, Math.floor(bounce_limit / (ray_depth * light_source_mul))));
+                    const frames = Math.ceil(selected_samples / samples);
+                    return { sample_count: samples, frame_count: frames };
+                }
+
+                function createTexture(width, height, internal_format)
+                {
+                    const level           = 0;
+                    const border          = 0;
+                    const format          = internal_format == gl.RGBA32F ? gl.RGBA : gl.RED;
+                    const type            = gl.FLOAT;
+                    const data            = null;
+
+                    const tex = gl.createTexture();
+                    gl.bindTexture(gl.TEXTURE_2D, tex);
+                    gl.texImage2D(gl.TEXTURE_2D, level, internal_format,
+                                  width, height, border,
+                                  format, type, data);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                    return tex;
+                }
+
+                function createBackbuffer(width, height, ratio_est)
+                {
+                    const tex = createTexture(width, height, gl.RGBA32F);
+
+                    const fbo = gl.createFramebuffer();
+                    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+                    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+
+                    var backbuffer = { texture: tex, FBO: fbo };
+
+                    if(ratio_est)
+                    {
+                        backbuffer.second_texture = createTexture(width, height, gl.RGBA32F);
+                        backbuffer.third_texture = createTexture(width, height, gl.RGBA32F);
+
+                        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, backbuffer.second_texture, 0);
+                        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT2, gl.TEXTURE_2D, backbuffer.third_texture, 0);
+                        gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2 ]);
+                    }
+                    else
+                    {
+                        gl.drawBuffers([ gl.COLOR_ATTACHMENT0 ]);
+                    }
+
+                    return backbuffer;
+                }
+
+                function deleteBackbufferSurface(surface)
+                {
+                    gl.deleteFramebuffer(surface.FBO);
+
+                    if(surface.second_texture != null)
+                    {
+                        gl.deleteTexture(surface.second_texture);
+                        gl.deleteTexture(surface.third_texture);
+                    }
+                    gl.deleteTexture(surface.texture);
+                }
+
+                function deleteBackbufferSwapChain(chain)
+                {
+                    deleteBackbufferSurface(chain.front_surface);
+                    deleteBackbufferSurface(chain.back_surface);
+                }
+                
+                function updateCanvasSize()
+                {
+                    canvas.width = draw_surface_box.offsetWidth;
+                    canvas.height = window.innerHeight;
+                    ctx_2d.canvas.width = canvas.width;
+                    ctx_2d.canvas.height = canvas.height;
+                }
+
+                function isRatioEstimator(selected_integrator)
+                {
+                    return selected_integrator == 2 || selected_integrator == 4;
+                }
+
+                function backbufferResize(frame_info)
+                {
+                    if(frame_info.frame_count == 1)
+                        return;
+                    
+                    var ratio_est = isRatioEstimator(integrator);
+                    if(backbuffer_swap_chain != null &&
+                       canvas.width == backbuffer_swap_chain.width &&
+                       canvas.height == backbuffer_swap_chain.height &&
+                       ratio_est == backbuffer_swap_chain.ratio_estimator)
+                        return;
+
+                    if(backbuffer_swap_chain != null)
+                    {
+                        deleteBackbufferSwapChain(backbuffer_swap_chain);
+                    }
+
+
+                    backbuffer_swap_chain = { front_surface: createBackbuffer(canvas.width, canvas.height, ratio_est),
+                                              back_surface: createBackbuffer(canvas.width, canvas.height, ratio_est),
+                                              ratio_estimator: ratio_est,
+                                              width: canvas.width,
+                                              height: canvas.height };
+                }
+
+                window.onresize = () => {
+                    updateCanvasSize();
+                    redraw();
+                } 
+
+                updateCanvasSize();
+
+                program = null;
+
+                prev_req_id = null;
+                function drawFrame(frame_info, remaining_frames)
+                {
+                    backbufferResize(frame_info);
+
+                    if(prev_req_id != null)
+                    {
+                        window.cancelAnimationFrame(prev_req_id);
+                        prev_req_id = null;
+                    }
+
+                    if(frame_info.frame_count > 1)
+                    {
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, backbuffer_swap_chain.front_surface.FBO);
+                        var ratio_est = isRatioEstimator(integrator);
+                        if(ratio_est)
+                        {
+                            gl.drawBuffers([ gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2 ]);
+                        }
+                        else
+                        {
+                            gl.drawBuffers([ gl.COLOR_ATTACHMENT0 ]);
+                        }
+                    }
+                    else
+                    {
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                    }
+                    
+                    const albedo_rgb = parseRGB(albedo_form.value);
+                    const sky_color_rgb = parseRGB(sky_color_form.value);
+
+                    var sample_count = remaining_frames > 1 ? frame_info.sample_count : (sample_count_form.value - (frame_info.frame_count - 1)*frame_info.sample_count);
+                    
+                    gl.useProgram(program.code);
+
+                    const frame_idx = frame_info.frame_count - remaining_frames;
+
+                    if(program.MultiFrameMixFactor != null)
+                    {
+                        const prev_frame_count = frame_idx * frame_info.sample_count;
+                        const ratio = sample_count / (prev_frame_count + sample_count);
+
+                        gl.activeTexture(gl.TEXTURE0);
+                        gl.bindTexture(gl.TEXTURE_2D, backbuffer_swap_chain.back_surface.texture);
+                        gl.uniform1i(program.PrevFrame, 0);
+
+                        if(program.PrevFrame2 != null)
+                        {
+                            gl.activeTexture(gl.TEXTURE1);
+                            gl.bindTexture(gl.TEXTURE_2D, backbuffer_swap_chain.back_surface.second_texture);
+                            gl.uniform1i(program.PrevFrame2, 1);
+
+                            gl.activeTexture(gl.TEXTURE2);
+                            gl.bindTexture(gl.TEXTURE_2D, backbuffer_swap_chain.back_surface.third_texture);
+                            gl.uniform1i(program.PrevFrame3, 2);
+                        }
+
+                        gl.uniform4f(program.MultiFrameMixFactor, 1.0 - ratio, ratio, 0, 0);
+                    }
+
+                    gl.uniform2f(program.iResolution, canvas.width, canvas.height);
+                    gl.uniform4ui(program.IntegratorParameters, frame_idx, sample_count, 0, ray_depth_form.value);
+                    gl.uniform4f(program.CameraParameters, camera_x, camera_y, camera_z, light_intensity_multiplier);
+                    gl.uniform4f(program.VolumeParameters, extinction.value, hg_g_form.value, 0, 0);
+                    gl.uniform4f(program.VolumeParameters2, albedo_rgb[0], albedo_rgb[1], albedo_rgb[2], 0);
+                    gl.uniform4f(program.SkyColor, sky_color_rgb[0], sky_color_rgb[1], sky_color_rgb[2], 0);
+
+                    gl.drawArrays(gl.TRIANGLES, 0, 3);
+                    
+                    ctx_2d.clearRect(0, 0, ctx_2d.canvas.width, ctx_2d.canvas.height);
+                    if(frame_info.frame_count > 1)
+                    {
+                        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+                        gl.useProgram(blit_program.code);
+
+                        gl.activeTexture(gl.TEXTURE0);
+                        gl.bindTexture(gl.TEXTURE_2D, backbuffer_swap_chain.front_surface.texture);
+                        gl.uniform1i(blit_program.InputTexture, 0);
+
+                        gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+                        if(remaining_frames > 1)
+                        {
+                            ctx_2d.fillStyle = "grey";
+                            ctx_2d.font = "24px san-serif";
+                            ctx_2d.fillText("Rendering... (" + (frame_idx + 1) + "/" + frame_info.frame_count + ")", 10, 30);
+
+                            [ backbuffer_swap_chain.front_surface, backbuffer_swap_chain.back_surface ] = [ backbuffer_swap_chain.back_surface, backbuffer_swap_chain.front_surface ];
+                            prev_req_id = requestAnimationFrame(() => { drawFrame(frame_info, remaining_frames - 1); });
+                        }
+                        else
+                        {
+                            rendering_element.value = 'false';
+                        }
+                    }
+                    else
+                    {
+                        rendering_element.value = 'false';
+                    }
+                }
+
+                // drawing procedure, including parameter setup
+                function redraw()
+                {
+                    gl.viewport(0, 0, canvas.width, canvas.height);
+
+                    const frame_info = getComputationFrameCount(); 
+                    if(frame_info.frame_count > 1)
+                    {
+                        console.log("info: drawing in multi-frame mode frame count(frames: " + frame_info.frame_count.toString() + ", samples: " + frame_info.sample_count.toString() + ")");
+                    }
+
+                    rendering_element.value = 'true';
+
+                    drawFrame(frame_info, frame_info.frame_count);
+                }
+
+                // assign new integrator
+                function assignIntegrator(rb_integrator)
+                {
+                    switch(rb_integrator.value)
+                    {
+                    case "box_importance": integrator = 0; break;
+                    case "ray_marching": integrator = 1; break;
+                    case "ratio_estimator": integrator = 2; break;
+                    case "distance_sampling": integrator = 3; break;
+                    case "ratio_estimator_distance_sampling": integrator = 4; break;
+                    }
+                }
+
+                // handle change of integrator
+                function changeIntegrator()
+                {
+                    const integrators = document.querySelectorAll('input[name="integrator"]');
+                    for (const rb_integrator of integrators)
+                    {
+                        if(rb_integrator.checked)
+                        {
+                            assignIntegrator(rb_integrator);
+                            program = getShaderFromCache(gl);
+                            redraw();
+                            break;
+                        }
+                        rb_integrator.onchange = changeIntegrator;
+                    }
+                }
+
+                // set callback for change of integrator
+                const integrators = document.querySelectorAll('input[name="integrator"]');
+                for (const integrator of integrators)
+                {
+                    integrator.onchange = changeIntegrator;
+                }
+
+                // handle change of scene
+                const scenes = document.querySelectorAll('input[name="scene"]');
+                function changeScene()
+                {
+                    for (const rb_scene of scenes)
+                    {
+                        if(rb_scene.checked)
+                        {
+                            switch(rb_scene.value)
+                            {
+                            case "box_scene": scene = 0; SetupBoxScene(); break;
+                            case "gobo_scene": scene = 1; SetupGoboScene(); break;
+                            }
+                            program = getShaderFromCache(gl);
+                            redraw();
+                            break;
+                        }
+                    }
+                }
+
+                // set change of scene callback
+                for (const rb_scene of scenes)
+                {
+                    rb_scene.onchange = changeScene;
+                }
+
+                // handle zoom with scroll wheel
+                function zoomView(ev)
+                {
+                    camera_z += ev.deltaY>0 ? wheel_speed : -wheel_speed;
+                    redraw();
+                }
+
+                canvas.addEventListener("wheel", zoomView);
+                ui_elements_surface.addEventListener("wheel", zoomView);
+
+                // option to disable options for outside script control purposes
+                const disable_opts = url_params.get("disable_opts");
+                if(disable_opts == 'true')
+                {
+                    console.log("Disabled parameter options");
+                    parameters_box = document.getElementById("parameters_box");
+                    parameters_box.style.display = "none";
+                    draw_surface_box.style.width = "100%";
+                    updateCanvasSize();
+                }
+
+                // sample count change through url parameters
+                const sample_count_opts = parseInt(url_params.get("sample_count"));
+                if(sample_count_opts)
+                {
+                    sample_count_form.value = sample_count_opts;
+                }
+
+                const ray_depth_opts = parseInt(url_params.get("ray_depth"));
+                if(ray_depth_opts)
+                {
+                    ray_depth_form.value = ray_depth_opts;
+                }
+
+                // integrator change through url parameters
+                const integrator_opts = url_params.get("integrator");
+                if(integrator_opts)
+                {
+                    for (const rb_integrator of integrators)
+                    {
+                        if(rb_integrator.value == integrator_opts)
+                        {
+                            rb_integrator.checked = true;
+                            assignIntegrator(rb_integrator);                     
+                        }
+                    }
+                }
+
+                albedo_opts = url_params.get("albedo");
+                if(albedo_opts != null)
+                {
+                    albedo_form.value = '#' + albedo_opts;
+                }
+
+                program = getShaderFromCache(gl);
+
+                redraw();
+            }
+         </script>
+    
+</body></html>
