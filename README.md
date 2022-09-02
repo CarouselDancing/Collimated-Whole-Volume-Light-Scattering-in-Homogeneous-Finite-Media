@@ -3,7 +3,7 @@
 Demo code in this repository (Supplemental shader.htm)<br><br>
 Links:
 * [Project page](http://3dgraphics.guru/publication/box-medium/)<br>
-* [Paper](https://ieeexplore.ieee.org/document/9715049) and [PDF](http://3dgraphics.guru/pdf/VM22_TVCG.pdf)<br>
+* [Paper](https://ieeexplore.ieee.org/document/9715049) and [PDF](http://farpeek.com/TVCGBoxMedium.pdf)<br>
 * [Video](http://3dgraphics.guru/video/box-medium.mp4)<br>
 * Supplemental materials:
   * [Step-by-step derivation](http://3dgraphics.guru/pdf/VM22_TVCG_supp_1.pdf)
